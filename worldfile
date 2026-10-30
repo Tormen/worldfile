@@ -1,0 +1,879 @@
+#!/bin/dash
+
+#DBG=1; can be turned on with -D
+DBG=; # DBG=1; # == ON  ///  DBG=; == OFF - prints debug messages to stderr!
+# CREATE INITIAL VERSION OF WORLDFILE:
+#   * brew:  brew bundle dump
+#            //should be identical with//
+#            ( brew tap|sed -e 's/^\(.*\)$/tap "\1"/'; brew leaves|sed -e 's/^\(.*\)$/brew "\1"/'; brew list --cask -1|sed -e 's/^\(.*\)$/cask "\1"/'; )>Brewfile.mine
+
+# The settings: printed by --create-config, and in effect when no config file is found.
+default_config_content() {
+    cat <<'_EOF'
+# worldfile config -- plain shell, sourced at startup (worldfile --help: where it is looked for)
+
+# brew, fedora, arch, debian or opensuse; empty = detected: brew on macOS,
+# else the ID (or ID_LIKE) in /etc/os-release
+DISTRO=
+
+# the world file: the packages this machine should have
+WORLDFILE="/etc/package-list"
+
+# the keep list: the world file stripped to package names, rebuilt by every command that needs it
+# (brew keeps its Brewfile.lock.json beside it); empty = /var/cache/worldfile/<DISTRO>.keeplist,
+# fedora: a temp file of the run
+KEEPFILE=
+
+# brew only: the brew to run; empty = /opt/homebrew/bin/brew, else /usr/local/bin/brew
+c_BREW=
+
+# width of the name column in the "nice" lists (-ll, -mm, ...)
+MAX_PACKAGE_NAME_LENGTH=40
+
+# arch only: the package manager command (yaourt, pacman, "sudo -u <user> pacaur", ...)
+c_ARCH="yay"
+
+# fedora only: dnf, and the transactions that built the image -- what they installed is
+# the image's, not "on top" of the world file (dnf5 history list: the first, kiwi's)
+c_DNF=dnf5
+FEDORA_IMAGE_TRANSACTIONS="1 2"
+_EOF
+}
+
+NL="
+"
+
+# The following flags COULD be globally forced to be SET here... but usually they are set by other mechanisms!
+    flag_rebuildKeepfile=;   # option that will be autodetermined (see XX_HERE_XX_4711)
+    flag_nicifyPackagelist=; # option that can be set for the LIST commands (see usage)
+    flag_PURGE=;             # option that also can be set via the --purge parameter
+    flag_filterByLeadingSpaces=; # option to allow filtering packages via leading spaces from WORLDFILE
+
+##########################################################################################################
+# I N T E R N A L     V A R I A B L E S
+
+DIRTY=1; # =1; == ON, =; == OFF # 1 == do things dirty (and quicker) where possible
+
+CLEANUP_DONE=; # so that we know if we were in _trap already - to avoide multiple cleanups!
+TEMPFILES=; # space separated list of temp files to remove on cleanup!
+
+##########################################################################################################
+
+usage() {
+    echo "usage: $0 [OPTIONS] COMMAND
+
+The worldfile should contain the explicit list of packages that you want on your system!
+Everything behind a '#' is considered as a comment (so whole lines, or end-of line comments).
+
+We do allow a space limited list of packages in one line in the worldfile!
+(they will be split and listed each in their own line in the KEEPFILE)
+
+_______________________________________________________________________________________________________
+
+COMMANDS:
+    -h|--help == show this text
+
+    -l        == list worldfile - INcluded
+    -L        == list worldfile - EXcluded files (commmented out)
+    //// FILTER PACKAGES BY # OF LEADING WHITESPACES:
+    -l0       == list worldfile - INcluded, but only packages with NO whitespaces in front of them
+    -l<x>     == list worldfile - INcluded, but only packages with <x> whitespaces in front of them
+    -l<x>-<y> == list worldfile - INcluded, but only packages with x-y whitespaces in front of them
+
+    -i  == list *INvalid* packages from worldfile (checks in-validity of output of -l)
+    -I  == list only VALID packages from worldfile (checks validity of output of -l)
+
+    -m  == list    \"missing packages\" in worldfile which are NOT installed
+    -M  == INSTALL \"missing packages\" in worldfile which are NOT installed [w. question to confirm!!!]
+
+    -c  == list    \"commented packages\" from worldfile which are installed
+    -C  == REMOVE  \"commented packages\" from worldfile which are installed [w. question to confirm!!!]
+
+    -o  == list    \"orphaned packages\" NOT claimed by the worldfile (or its dependencies)
+    -O  == REMOVE  \"orphaned packages\" NOT claimed by the worldfile (or its dependencies) [w. question to confirm!!!]
+
+    -s  == list    \"sections\" from worldfile (lines starting with \"###\") -- in the original order -- into less!
+
+    --create-config [FILE] == print the default config, or write it to FILE (never over an existing one)
+    --run-tests [FILTER]   == run the self-tests whose name contains FILTER (all without one)
+
+CONFIG: \$WORLDFILE_CONFIG, else --config <FILE>, else the first that exists of
+    $(config_search_paths | xargs | sed 's/ /, /g').
+    With none, the defaults that --create-config prints apply -- DISTRO empty = detected from the OS.
+
+COMMAND OPTION FOR \"LIST\" COMMANDS:
+    If you provide the list command letter TWICE you'll get a NICE output: packagename + summary-description-of-package
+    For example:
+    -mm == list   \"missing packages\" nicely (packagename + summary)
+
+COMMAND OPTION FOR \"REMOVE\" COMMANDS:
+    --purge == if you provide this additional parameter, the remove will purge the config files
+
+FOR DEBUGGING PURPOSES:
+    -D|--debug == turn on debug output
+    -r  == force rebuilding keepfile <<< NOW DONE IMPLICITLY, WHEN NEEDED!
+    -R  == force rebuilding keepfile to stdout
+
+    -d  == list differences (with vimdiff) between worldfile and explicitely installed packages
+
+    -do == list    \"distro-orphaned packages\" from what the DISTRIBUTION thinks is orphaned (*independant* of this script)
+    -dO == REMOVE  \"distro-orphaned packages\" from what the DISTRIBUTION thinks is orphaned (*independant* of this script)
+
+##############################################################################
+
+SOME TERMS:
+    \"sections\"             == lines in the worldfile that start with at least 3 \"#\"
+    \"missing packages\"     == packages in worldfile which are NOT yet installed
+    \"commented packages\"   == packages commented in worldfile which are STILL installed
+    \"orphaned packages\"    == packages NOT claimed by worldfile + its dependencies
+                             == additional packages installed ontop of what is demanded by the worldfile
+
+    \"distro-orphaned packages\"  == like \"orphaned packages\" but relative to what the DISTRO thinks!
+                                     (so completely *independent* of this scripts functionality!)
+
+DISTRIBUTION SPECIFIC REMARKS:
+  'arch') Here the package names, /may/ contain the repository name, e.g. aur/... or extra/gvim
+
+"|less
+    exit 0    
+}
+
+tmp="
+EXAMPLE USAGES:
+    
+# LIST POSTITIVE TEST: *List* all missing packages AND DEPENDENCIES for worldfile:
+worldfile -r; worldfile -l|xargs yum install|grep -v 'already installed and latest version'
+
+# INSTALL POSTITIVE TEST: *Install* all missing packages AND DEPENDENCIES for worldfile: (!! WITHOUT QUESTION/PAUSE !!)
+worldfile -r; worldfile -l|xargs yum install -y|grep -v 'already installed and latest version'
+
+# LIST all commented out package names from worldfile and possible dependencies that could be removed with worldfile:
+worldfile -r; worldfile -L|xargs yum remove 2>&1|grep -v 'No Match for argument'
+"
+
+# returns 0 = yes(success)  AND  1 = no(failed)
+getOK() { local _ASKSTRING=$1;
+  local _a="";
+  while [ 1 ]; do
+    printf "$_ASKSTRING";
+    read _a;
+    [ $DBG ] && echo "DBG: getOK(): got '$_a'"
+    case "$_a" in
+      [yY]|[yY][eE][sS]|[zZ]|[zZ][eE][sS]) [ $DBG ] && echo "DBG: getOK(): return 0 (yes)";
+      return 0;;
+      [nN]|[nN][oO]|[nN][oO][nN]) [ $DBG ] && echo "DBG: getOK(): return 0 (yes)";
+      return 1;;
+    esac
+  done;
+}
+
+##########################################################################################################
+# I N T E R N A L     F U N C T I O N S
+
+err() { echo "$1"; exit 1; }
+
+XXXX() { err "FUNCTION '$2' NOT YET IMPLEMENTED FOR DISTRO '$1'!!!"; }
+
+config_search_paths() { # the config files looked for, in order, when neither $WORLDFILE_CONFIG nor --config names one
+    printf '%s\n' "${LINKS:-/LINKS}/default/worldfile.conf" "${LINKS:-/LINKS}/default/worldfile" \
+        "$HOME/.worldfile.conf" /etc/worldfile.conf /usr/local/etc/worldfile.conf
+}
+
+load_config() { # load_config [FILE] -- the defaults, then FILE ($WORLDFILE_CONFIG first) or the first one found
+    eval "$(default_config_content)"
+    _cf=${WORLDFILE_CONFIG:-$1}
+    if [ -z "$_cf" ]; then
+        for _p in $(config_search_paths); do [ -f "$_p" ] && { _cf=$_p; break; }; done
+    fi
+    if [ -n "$_cf" ]; then
+        [ -r "$_cf" ] || err "cannot read the config '$_cf'"
+        # shellcheck disable=SC1090  # the config is chosen at run time
+        . "$_cf" || err "the config '$_cf' failed"
+    fi
+    [ -n "$DISTRO" ] || detect_distro
+}
+
+detect_distro() { # sets DISTRO to what this machine runs: brew on macOS, else the first known ID / ID_LIKE of os-release
+    [ "$(uname -s)" = Darwin ] && { DISTRO=brew; return 0; }
+    [ -r "$OS_RELEASE" ] || err "cannot detect DISTRO: '$OS_RELEASE' is missing -- set DISTRO in the config (--create-config)"
+    # shellcheck disable=SC1090,SC2153  # os-release is shell syntax and sets ID / ID_LIKE
+    for _id in $(. "$OS_RELEASE"; echo "$ID $ID_LIKE"); do
+        case "$_id" in
+            fedora|arch|debian) DISTRO=$_id; return 0 ;;
+            opensuse*)          DISTRO=opensuse; return 0 ;;
+        esac
+    done
+    # shellcheck disable=SC1090  # os-release, as above
+    err "cannot detect DISTRO: no known ID in '$OS_RELEASE' ($(. "$OS_RELEASE"; echo "ID=$ID ID_LIKE=$ID_LIKE")) -- set DISTRO in the config"
+}
+OS_RELEASE=/etc/os-release
+
+create_config() { # create_config [FILE] -- the default config to stdout, or into FILE when it does not exist yet
+    [ -z "$1" ] && { default_config_content; return; }
+    [ -e "$1" ] && err "--create-config: '$1' exists already -- not overwritten"
+    default_config_content > "$1" || err "--create-config: cannot write '$1'"
+    echo " >>> default config written to $1"
+}
+
+new_tempfile() { # a new, empty temp file -- one per call
+    mktemp "${TMPDIR:-/tmp}/worldfile.XXXXXX" || err "mktemp failed"
+}
+
+nicifyPackagelist() { local fn=nicifyPackagelist;
+    # reads a list of packages to nicify from stdin
+    # missingPackages == packages NOT found in the list
+    
+    case $DISTRO in
+
+        fedora) while read a; do echo "$a"; done|sort|uniq|while read a; do [ -z "$a" ] && continue; rpm -q "$a" --queryformat '%'$MAX_PACKAGE_NAME_LENGTH'{NAME}\t# %{SUMMARY}\n'; done; ;;
+
+        arch)   while read a; do echo "$a"; done|sort|uniq|xargs $c_ARCH -Qi|while read a; do case "$a" in "Name "*) name="$(echo "$a"|cut -f 2 -d:)"; ;; "Description "*) printf "%${MAX_PACKAGE_NAME_LENGTH}s %s\n" "$name" "$(echo "$a"|cut -f 2 -d:)"; ;; esac; done; ;;
+        #arch)   while read a; do echo "$a"; done|sort|uniq|while read a; do [ -z "$a" ] && continue; printf "%${MAX_PACKAGE_NAME_LENGTH}s %s\n" "$a" "$($c_ARCH -Qi vim|grep "^Description"|cut -f 2 -d:)"; done; ;;
+
+        debian) 
+            # all packages to nicify into apt-cache show --> loop over and see which ones in the /output/ are MISSING from the /input/ we provided!
+            tmpFile2=$(new_tempfile);
+            TEMPFILES="$TEMPFILES $tmpFile2"
+            while read a; do echo "$a"; done|sort|uniq|xargs apt-cache show >$tmpFile2;
+            mkdir -p /tmp/keep; cp "$tmpFile" "$tmpFile2" /tmp/keep/
+            # awk with multiple input files:
+            #     awk -F' *: *' "{if (NR == FNR) {print \"file-1\"} else { print \"file-2\"}}" /tmp/file-1 /tmp/file-2
+            #unknownPackages=$(awk -F' *: *' "{if (NR==FNR) missingPackages[\$0]; else if (\$1 == \"Package\") delete missingPackages[\$2]}END{for (x in missingPackages) printf \"%s\n\",x}" $tmpFile $tmpFile2|sort|xargs echo);
+            unknownPackages=$(awk -F' *: *' "{if (NR==FNR) missingPackages[\$0]; else { if (\$1 == \"Package\") pkgName=\$2; else if (\$1 == \"Architecture\") { pkgName=sprintf(\"%s:%s\", pkgName, \$2); delete missingPackages[pkgName];};};}END{for (x in missingPackages) printf \"%s\n\",x}" $tmpFile $tmpFile2|sort|xargs echo);
+            result=$(awk -F : "{if (\$1 == \"Package\") { p=\$2; next; }; if (\$1==\"Description\" || \$1==\"Description-en\") { printf \"%${MAX_PACKAGE_NAME_LENGTH}s %s\\n\",p,\$2}}" $tmpFile2|sort|uniq);
+            echo "$result";
+            [ -n "$unknownPackages" ] && echo && echo "UNKNOWN PACKAGES: $unknownPackages";
+
+            #foundPackages=$(apt-cache show $(cat $tmpFile)|awk -F : "BEGIN{cnt=1; }{if (\$1 == \"Package\") { FOUND[cnt]=\$2; cnt+=1; }}END{for (x in FOUND) print x}");
+            #echo "foundPackages='$foundPackages'";
+            ;;
+
+        #debian) while read a; do [ -z "$a" ] && continue; printf "%${MAX_PACKAGE_NAME_LENGTH}s %s\n" "$a" "$(apt-cache search "^$a$"|cut -f 3- -d' ')"; done; ;;
+        #debian) while read a; do [ -z "$a" ] && continue; echo "------ $a ------"; apt-cache search "^$a$"; return; done; ;;
+    
+        opensuse) while read a; do echo $a; done|xargs zypper --terse search --match-exact --case-sensitive --type package|tail -n+6; ;;
+
+        *) XXXX $DISTRO $fn; ;;
+
+    esac
+}
+
+
+_cleanup_() {
+    [ $CLEANUP_DONE ] && return;
+    [ $DBG ] && echo && echo "CLEANUP! ($?) [$*]" 1>&2;
+    [ -n "$TEMPFILES" ] && rm -f $TEMPFILES;
+    CLEANUP_DONE=1
+    exit;
+}
+
+
+##########################################################################################################
+# C O M M A N D      F U N C T I O N S
+
+# uses flag_filterByLeadingSpaces
+list_worldfile() { # == includes
+    case $DISTRO in
+        brew) APPENDIX="$(cat "$WORLDFILE"|sed -n 's/^[[:space:]]*##*[[:space:]]*\(manual[[:space:]][[:space:]]*[^[:space:]][^[:space:]]*\).*/\1/p'|sort)";;
+        *) APPENDIX="";;
+    esac
+
+    # fedora: for a in $(rpmorphan -list-keep); do echo "$a"; done
+    # GENERAL:
+    if [ -z "$flag_filterByLeadingSpaces" ]; then 
+      cat "$KEEPFILE"
+      [ -n "$APPENDIX" ] && echo "$APPENDIX"
+    else
+      echo "cat \"$WORLDFILE\"|grep -v '^[[:space:]]*#'|sed -n \"s/^[[:space:]]\\{$flag_filterByLeadingSpaces\\}\\([^[:space:]]\\)/\\1/p\"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*/ /g'|grep -v '^[[:space:]]*$'"
+      cat "$WORLDFILE"|grep -v '^[[:space:]]*#'|sed -n "s/^[[:space:]]\{$flag_filterByLeadingSpaces\}\([^[:space:]]\)/\1/p"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*/ /g'|grep -v '^[[:space:]]*$'
+      [ -n "$APPENDIX" ] && echo "$APPENDIX"
+    fi
+}
+list_worldfile_comments() { # == excludes
+    case $DISTRO in
+        brew) cat "$WORLDFILE"|grep -v '^[[:space:]]*##*[[:space:]]*manual[[:space:]][[:space:]]*[^[:space:]][^[:space:]]*.*'|sed -n 's/^[[:space:]]*#/#/p'|sed -e 's/.*[[:space:]]*#/#/'|grep -v '^[[:space:]]*$'
+        ;;
+        *) cat "$WORLDFILE"|sed -n 's/^[[:space:]]*#/#/p'|sed -e 's/.*[[:space:]]*#/#/'|grep -v '^[[:space:]]*$'
+           [ $DBG ] && echo "DBG: cat \"$WORLDFILE\"|sed -n 's/^[[:space:]]*#/#/p'|sed -e 's/.*[[:space:]]*#/#/'|grep -v '^[[:space:]]*$'" 1>&2
+        ;;
+    esac
+}
+
+
+list_invalid_worldfile_entries() { local fn=list_invalid_wordfile_entries;
+    case $DISTRO in
+        fedora) XXXX fedora $fn; ;;
+        arch)   $0 -l|while read a; do 
+                    [ $DBG ] && echo "DBG: $c_ARCH -Ss \"^${a}$\"" 1>&2
+                    $c_ARCH -Ss "^${a}$" >/dev/null || echo "$a INVALID"; # "$c_ARCH -Qs" did NOT work!!??
+                done; ;;
+        debian) XXXX debian $fn; ;;
+        opensuse) $0 -l|xargs zypper --non-interactive install --dry-run 2>/dev/null|sed -n "s/^'\([^']*\)' not found in package names.*/\1/p"; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}    
+list_valid_worldfile_entries() { local fn=listvalid_worldfile_entries;
+    case $DISTRO in
+        fedora) XXXX fedora $fn; ;;
+        arch)   $0 -l|while read a; do $c_ARCH -Ss "^${a}$" >/dev/null && echo "$a VALID"; done; ;; # "$c_ARCH -Qs" did NOT work!!??
+        debian) XXXX debian $fn; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}    
+
+
+list_dnf() { # list_dnf FILE ARGS... -- "$c_DNF" ARGS into FILE; its stderr is shown only when it fails
+    _ld_f=$1; shift
+    # shellcheck disable=SC2154  # c_DNF is set by the config
+    "$c_DNF" "$@" > "$_ld_f" 2> "$_ld_f.err" && return 0
+    _ld_rc=$?; cat "$_ld_f.err" 1>&2; err "FAILED [$_ld_rc] $c_DNF $*"
+}
+
+list_orphanedPackages() { local fn=list_orphanedPackages;
+    case $DISTRO in
+        fedora) # what dnf records as installed on purpose, minus what the image installed, minus the world
+                # file (its '# manual' entries too); dependencies are out already: dnf records them as such
+            _usr=$(new_tempfile); _img=$(new_tempfile); _keep=$(new_tempfile)
+            TEMPFILES="$TEMPFILES $_usr $_usr.err $_img $_img.err $_keep"
+            list_dnf "$_usr" repoquery --userinstalled --qf '%{name}\n'
+            : > "$_img"   # no image transactions configured: 'history info' with none would list the LAST one
+            # shellcheck disable=SC2086  # FEDORA_IMAGE_TRANSACTIONS is a list of ids
+            [ -n "$FEDORA_IMAGE_TRANSACTIONS" ] && list_dnf "$_img" history info $FEDORA_IMAGE_TRANSACTIONS
+            { cat "$KEEPFILE"
+              sed -n 's/^[[:space:]]*##*[[:space:]]*manual[[:space:]][[:space:]]*\([^[:space:]]*\).*/\1/p' "$WORLDFILE" | tr -d '"'
+            } | LC_ALL=C sort -u > "$_keep"
+            # 'history info' rows: "  Install name-epoch:version-release.arch  Reason  Repository"
+            awk '/^  / && $2 ~ /:/ { print $2 }' "$_img" | sed 's/-[^-]*-[^-]*$//' >> "$_keep"
+            LC_ALL=C sort -u "$_keep" -o "$_keep"
+            LC_ALL=C sort -u "$_usr" | LC_ALL=C comm -23 - "$_keep"
+            ;;
+        brew) [ $DBG ] && echo "   \"$c_brew\" bundle --file="$KEEPFILE" --verbose cleanup";
+              "$c_brew" bundle --file="$KEEPFILE" --verbose cleanup ;;
+        arch)  $c_ARCH -Qtdq ;; # pacaur -Qtdi; ;;
+               # Either pacman -Qdtq | sudo pacman -Rns -   # <<< removes all unneeded packages, but leaves optional dependencies intact
+               # Or     pacman -Qdttq | sudo pacman -Rns -  # <<< removes optional dependencies as well
+        debian)
+            #echo "deborphan -k '$KEEPFILE'" 1>&2 # DBG:
+            deborphan -a -k "$KEEPFILE"|awk '{print $2}' 2>&1 #|sed -n 's/deborphan: package \(.*\) not found or not installed/\1/p'; ;;
+            ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+remove_orphanedPackages() { local fn=remove_orphanedPackages;
+    if [ "$DISTRO" != "brew" ]; then tmp="$( $0 -o )"; [ -z "$tmp" ] && return; fi # nothing to do
+    case $DISTRO in
+        fedora) yum remove $tmp; ;;
+        brew) [ $DBG ] && echo "   \"$c_brew\" bundle --file="$KEEPFILE" --verbose --force cleanup";
+              "$c_brew" bundle --file="$KEEPFILE" --verbose --force cleanup ;;
+        arch) $c_ARCH -R --nosave --recursive --unneeded $tmp; ;;  # == $c_ARCH -Rcsu
+            #tmp=$( $c_ARCH -Q --deps --unrequired| xargs echo );
+            #[ -n "$tmp" ] && $c_ARCH -R --cascade --recursive --unneeded $tmp; ;;  # == $c_ARCH -Rcsu
+        debian) [ $flag_PURGE ] && opt=--purge || opt=; apt-get remove -V $opt $tmp; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+
+
+list_distro_orphanedPackages() { local fn=list_distro_orphanedPackages;
+    case $DISTRO in
+        fedora) rpmorphan -dry-run -all; ;;
+        #arch)   $c_ARCH -Q --deps --unrequired; ;; # == $c_ARCH -Qdt
+        arch)  
+            tmp=$( $c_ARCH -Q --deps --unrequired| xargs echo );
+            [ -n "$tmp" ] && $c_ARCH -R --cascade --recursive --unneeded --print $tmp; ;;  # == $c_ARCH -Rcsu
+        debian) deborphan; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+remove_distro_orphanedPackages() { local fn=remove_distro_orphanedPackages;
+    case $DISTRO in
+        fedora) yum remove $( $0 -o ); ;;
+        arch)
+            tmp=$( $c_ARCH -Q --deps --unrequired| xargs echo );
+            [ -n "$tmp" ] && $c_ARCH -R --cascade --recursive --unneeded $tmp; ;;  # == $c_ARCH -Rcsu
+        debian) XXXX debian $fn; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+
+
+list_missingPackages() { local fn=list_missingPackages;
+    case $DISTRO in
+        brew)
+            if [ $DBG ]; then
+              echo "DBG: list_missingPackages(): NORMALLY: \"$c_brew\" bundle --file=\"$KEEPFILE\" check --verbose|grep -v \"^The Brewfile's dependencies are satisfied\""
+              echo "DBG: list_missingPackages(): But running now simply: \"$c_brew\" bundle --file=\"$KEEPFILE\" check --verbose"
+              "$c_brew" bundle --file="$KEEPFILE" check --verbose
+            else
+              "$c_brew" bundle --file="$KEEPFILE" check --verbose|grep -v "^The Brewfile's dependencies are satisfied.\|\"$c_brew\" bundle can't satisfy your .* dependencies.\|Satisfy missing dependencies with .*"|sed -e 's/→ Formula \(.*\) needs to be installed or updated./brew "\1"/'|sed -e 's/→ Cask \(.*\) needs to be installed or updated./cask "\1"/'|sed -e 's/→ Tap \(.*\) needs to be tapped./tap "\1"/'
+            fi
+            ;;
+        fedora) $0 -l|xargs yum install|grep -v 'already installed and latest version'; ;;
+        arch) 
+            ### Filter all non-installed packages (including groups):
+            # -Q only works on INSTALLED stuff !!
+            # --> so we'll filter the errors as the missing packages!
+            [ $DBG ] && echo "DBG: $c_ARCH -Q $(cat "$KEEPFILE"|xargs echo) 2>&1 >/dev/null" 1>&2
+            tmp="$($c_ARCH -Q $(cat "$KEEPFILE"|xargs echo) 2>&1 >/dev/null)";
+            [ $DBG ] && echo "DBG: --> tmp='$tmp' (output of $c_ARCH -Q <KEEPFILE>)" 1>&2
+            [ -z "$tmp" ] && return;
+            tmp2="$(echo "$tmp"|sed -n "s/^error: package '\([^']\+\)' was not found$/\1/p")"
+            [ $DBG ] && echo "DBG: --> tmp2='$tmp2' (tmp stripped to package names)" 1>&2
+            [ "$(echo "$tmp"|wc -l)" != "$(echo "$tmp2"|wc -l)" ] && err "list_missingPackages: INTERNAL ERROR. There seems to be a format problem in the output of pacaur -Q. (See tmp='$tmp', tmp2='$tmp2'.)"
+
+            ### Filter out groups:
+            [ $DBG ] && echo "DBG: $c_ARCH -Q --groups $(echo "$tmp2"|xargs echo) 2>&1 >/dev/null" 1>&2
+            tmp="$($c_ARCH -Q --groups $(echo "$tmp2"|xargs echo) 2>&1 >/dev/null)"
+            [ $DBG ] && echo "DBG: --> tmp='$tmp' (output of $c_ARCH -Q --groups <KEEPFILE>)" 1>&2
+            [ -z "$tmp" ] && return;
+            tmp2="$(echo "$tmp"|sed -n "s/^error: group '\([^']\+\)' was not found$/\1/p")"
+            [ $DBG ] && echo "DBG: --> tmp2='$tmp2' (tmp stripped to package names)" 1>&2
+            [ "$(echo "$tmp"|wc -l)" != "$(echo "$tmp2"|wc -l)" ] && err "list_missingPackages: INTERNAL ERROR. There seems to be a format problem in the output of pacaur -Q --groups. (See tmp='$tmp', tmp2='$tmp2'.)"
+
+            echo "$tmp2"|sort
+            ;; 
+        debian) cat "$KEEPFILE"|deborphan -a - 2>&1|sed -n 's/deborphan: package \(.*\) not found or not installed/\1/p'; ;;
+        #opensuse) $0 -l|xargs zypper --terse search --uninstalled --match-exact --type package|tail -n+6|cut -f 2 -d"|"; ;;
+        opensuse) $0 -l|xargs rpm -q|sed -n 's/^package \(.*\) is not installed$/\1/p'; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+install_missingPackages() { local fn=install_missingPackages;
+    [ $DBG ] && echo "DBG: install_missingPackages()"
+    case "$DISTRO" in
+    "brew")
+      tmp="$( $0 -m 2>&1)"; [ -n "$tmp" ] && echo " + Missing:$(echo; echo "$tmp"|sed -e 's/^/     /')";
+      ;;
+    *)
+      tmp="$( $0 -m|xargs echo )"; [ -n "$tmp" ] && echo " + Missing packages: '$tmp'";
+      ;;
+    esac
+
+    [ $DBG ] && echo "DBG: missing packages: '$tmp'" 1>&2
+    [ -z "$tmp" ] && return; # nothing to do
+
+    case $DISTRO in
+        fedora) yum install $tmp; ;; # yum install $( $0 -l )|grep -v 'already installed and latest version'; ;;
+        brew)
+            local taps="$(echo "$tmp"|sed -n 's/^.* [tT][aA][pP] \(.*\) needs to be tapped.*$/\1/p')";
+            local formulae="$(echo "$tmp"|sed -n -e 's/^.* [bB][rR][eE][wW] \(.*\) needs to be installed.*$/\1/p' -e 's/^.* Formula \(.*\) needs to be installed.*$/\1/p')";
+            local casks="$(echo "$tmp"|sed -n 's/^.* [cC][aA][sS][kK] \(.*\) needs to be installed.*$/\1/p')";
+            [ $DBG ] && echo "DBG: [yes, install/update] --> taps: echo '$taps'|xargs -n 1 \"$c_brew\" tap";
+            [ $DBG ] && echo "DBG: [yes, install/update] --> formulae: echo '$formulae'|xargs -n 10 \"$c_brew\" install";
+            [ $DBG ] && echo "DBG: [yes, install/update] --> casks: echo '$casks'|xargs -n 10 \"$c_brew\" install --cask";
+            getOK "\n   Do you want to install/update all the missing stuff? " || return 0;
+            echo "..."
+            [ -n "$taps" ]     && echo " > NEW TAPS:";         for a in $(echo "$taps"|xargs echo); do echo " >>   tap '$a'"; "$c_brew" tap "$a" || err "FAILED [$?] \"$c_brew\" tap \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL TAPS: for a in $(echo $taps|xargs echo); do \"$c_brew\" tap \"\$a\""; done;
+            [ -n "$formulae" ] && echo " > NEW FORMULAE:";     for a in $(echo "$formulae"|xargs echo); do echo " >>   '$a'"; "$c_brew" install "$a" || err "FAILED [$?] \"$c_brew\" install \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL FORMULAE: for a in $(echo $formulae|xargs echo); do \"$c_brew\" install \"\$a\""; done
+            [ -n "$casks" ]    && echo " > NEW CASKS:";        for a in $(echo "$casks"|xargs echo); do echo " >>   cask '$a'"; "$c_brew" install --cask "$a" || err "FAILED [$?] \"$c_brew install --cask \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL casks: for a in $(echo $casks|xargs echo); do \"$c_brew\" install --cask \"\$a\"; done${NL}${NL}REMARK: In case of FAILING cask installs because the dir /Application already exists, you can use this to remove them (probably) all:${NL}"'echo "$casks"|while read a; do a2="$(echo "$a"|sed -e "s/[-]//g")"; a3="$(echo "$a"|tr "-" " ")"; for c in "$a" "$a2" "$a3"; do b="$(ls -1 /Applications|grep -i "$c")"; [ $DBG ] && echo "DBG: c=\"$c\" -> b=\"$b\""; [ -n "$b" ] && echo "$b"; done; done|sort|uniq|while read a; do echo "$a..."; rm "/Applications/$a"; done'; done
+            #brew bundle --file="$KEEPFILE" install|grep -v "^Using ";
+            ;;
+        arch)  [ $DBG ] && echo "$c_ARCH -S $tmp" 1>&2
+               $c_ARCH -S $tmp; ;; # $c_ARCH -Sy; $c_ARCH -S --needed --asexplicit $(cat "$KEEPFILE"|xargs echo); ;; 
+        debian) apt-get install -V $tmp; ;; #  --no-install-recommends
+        opensuse) zypper --verbose install --details $tmp; ;; #  --no-install-recommends
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+
+
+list_commentedPackages_to_be_removed() { local fn=list_commentedPackages_to_be_removed;
+    tmp="$( $0 -L )"
+    [ -z "$tmp" ] && return; # nothing to do
+    case $DISTRO in
+        fedora) yum remove --dry-run $tmp; ;;
+        arch)  $c_ARCH -R --cascade --recursive --unneeded --print $tmp; ;; 
+        debian) XXXX debian $fn; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+remove_commentedPackages() { local fn=remove_commentedPackages;
+    tmp="$( $0 -L )"
+    [ -z "$tmp" ] && return; # nothing to do
+    case $DISTRO in
+        fedora) yum remove $tmp; ;;
+        arch)
+            tmpFile=$(new_tempfile);
+            TEMPFILES="$TEMPFILES $tmpFile"
+            $c_ARCH -Q|cut -f1 -d' '>$tmpFile;
+            tmp="$($0 -L|comm -12 - $tmpFile)"
+            echo " + Found these commented packages in the worldfile that are also currently installed:\n$tmp"
+            $c_ARCH -R --cascade --recursive --unneeded $tmp; ;; 
+        debian) XXXX debian $fn; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+
+
+list_sections() { 
+    # grep -v '^[[:space:]#]*$' <<< ignores lines with only # (and spaces)
+    cat "$WORLDFILE"|sed -n 's/[[:space:]]*###//p'|grep -v '^[[:space:]#]*$'|less
+}
+
+
+rebuild_keepfile() { local fn=rebuild_keepfile;
+    if [ -z "$DIRTY" -a "$DISTRO" = "fedora" ]; then
+        # for DISTRO=fedora: This is slightly NON-dirtier / cleaner, but SLOWER than the default:
+        rpmorphan -zero-keep; rebuild_keepfile_to_stdout|while read a; do rpmorphan -use-cache -add-keep "$a"; done
+    else
+        _kd=${KEEPFILE%/*}; mkdir -p -- "$_kd" && rebuild_keepfile_to_stdout > "$KEEPFILE" # DEFAULT WAY TO CREATE KEEPFILE (by just stripping out everything but the pure packagenames from the worldfile)
+    fi
+}
+rebuild_keepfile_to_stdout() { local fn=rebuild_keepfile_to_stdout;
+  # we DO allow space separated list of multiple packes in one line! -->  -e"s/ /\n/g" to split them :)
+  case "$DISTRO" in
+    brew)
+      tmpFile=$(new_tempfile); TEMPFILES="$TEMPFILES $tmpFile";
+      #[ $DBG ] && echo "DBG: rebuild_keepfile_to_stdout() --> tmpFile='$tmpFile'" 1>&2
+      #[ $DBG ] && echo "DBG: rebuild_keepfile_to_stdout() WORLDFILE='$WORLDFILE'" 1>&2
+
+      cat "$WORLDFILE"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*/ /' -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//'|grep -v '^[[:space:]]*$'|sort|uniq >"$tmpFile"
+      cat "$tmpFile"|grep "^tap"
+      cat "$tmpFile"|grep "^brew"
+      cat "$tmpFile"|grep "^cask"
+      return 0
+      ;;
+    arch)
+      cat "$WORLDFILE"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]]*//' -e's/[[:space:]]*$//' -e's|[^[:space:]]\+/\([^[:space:]]\+\)$|\1|' -e"s/ /\n/g"|grep -v '^[[:space:]]*$'|sort|uniq ;; # |while read a; do echo "$a"; done
+    *)
+      # strip out everything but the pure packagenames from the worldfile:
+      cat "$WORLDFILE"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]]*//' -e's/[[:space:]]*$//' -e"s/ /\n/g"|grep -v '^[[:space:]]*$'|sort|uniq ;;
+  esac
+}
+
+
+diff_between_worlfile_and_packageManager() { local fn=diff_between_worldfile_and_packageManager; local diffApp=$1;
+    case $DISTRO in
+        fedora) XXXX fedora; ;;
+        arch)
+            cd /tmp
+            tmpWorldfileList=worldfile-packagelist;
+            tmpPackageManagerList=pacman_-Qe___explicitly-installed-packages;
+            cp $KEEPFILE /tmp/$tmpWorldfileList
+            $c_ARCH -Qe|cut -f1 -d' '|sort|uniq >$tmpPackageManagerList
+            ;;
+        debian) XXXX debian $fn; ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+    $diffApp $tmpWorldfileList $tmpPackageManagerList
+    echo "============================================================================================="
+    echo "$diffApp /tmp/$tmpWorldfileList /tmp/$tmpPackageManagerList"
+}
+
+
+##########################################################################################################
+# Self-tests: 'worldfile --run-tests [SUBSTRING]'. They run a COPY of this file whose settings point
+# into a temp dir and whose package managers are stubs, so nothing is installed, removed or written
+# outside that dir.
+
+_rt_self() { # the real path of this file: follow symlinks one by one (no readlink -f on every BSD)
+  _rt_p=$0
+  while [ -L "$_rt_p" ]; do
+    _rt_l=$(readlink "$_rt_p") || return 1
+    case "$_rt_l" in
+      /*) _rt_p=$_rt_l ;;
+      *)  case "$_rt_p" in */*) _rt_p=${_rt_p%/*}/$_rt_l ;; *) _rt_p=$_rt_l ;; esac ;;
+    esac
+  done
+  case "$_rt_p" in */*) _rt_d=${_rt_p%/*} ;; *) _rt_d=. ;; esac
+  _rt_d=$(cd "${_rt_d:-/}" && pwd -P) || return 1
+  echo "$_rt_d/${_rt_p##*/}"
+}
+
+# shellcheck disable=SC2329  # the rt_ tests are called by name from the run list, and the helpers from them
+{
+_rt_check() {
+  if [ "$2" = "$3" ]; then echo "  PASS  $1"; _rt_pass=$((_rt_pass+1))
+  else printf '  FAIL  %s\n    got:  %s\n    want: %s\n' "$1" "$2" "$3"; _rt_fail=$((_rt_fail+1)); fi
+}
+_rt_copy() { # $T/wf: this file with its keep list in $T, brew = the stub, and uname / os-release read from $T
+  sed -e "s|^OS_RELEASE=.*|OS_RELEASE=$T/os-release|" -e "s|\"\$(uname -s)\"|\"\$(cat $T/uname)\"|" "$B" > "$T/wf"
+  chmod 700 "$T/wf"
+  for _rt_d in brew fedora; do # $T/wf.DISTRO: $T/wf with a config setting DISTRO and reading $T/world
+    printf 'DISTRO=%s\nWORLDFILE="%s/world"\nKEEPFILE="%s/keep"\nc_BREW="%s/bin/brew"\n' "$_rt_d" "$T" "$T" "$T" > "$T/conf.$_rt_d"
+    printf '#!/bin/sh\nWORLDFILE_CONFIG=%s/conf.%s exec %s/wf "$@"\n' "$T" "$_rt_d" "$T" > "$T/wf.$_rt_d"
+    chmod 700 "$T/wf.$_rt_d"
+  done
+}
+_rt_distro() { # _rt_distro UNAME [OS-RELEASE-LINE...] -- the DISTRO worldfile settles on (its -D dump), with no DISTRO set
+  echo "$1" > "$T/uname"; shift
+  printf '%s\n' "$@" > "$T/os-release"
+  printf 'WORLDFILE="%s/world"\n' "$T" > "$T/conf.empty"
+  WORLDFILE_CONFIG=$T/conf.empty "$T/wf" -D -R 2>&1 | sed -n "s/^DISTRO='\(.*\)'$/\1/p"
+  echo Darwin > "$T/uname"
+}
+
+rt_brew_R() {
+  _rt_check "brew -R: taps, then brews, then casks; comments and blanks dropped" \
+    "$("$T/wf.brew" -R)" "$(printf '%s\n' 'tap "a/b"' 'brew "git"' 'brew "grep"' 'cask "iterm2"')"
+}
+rt_brew_l() {
+  _rt_check "brew -l: the keep list, then the '# manual' entries (each cut at its first blank)" \
+    "$("$T/wf.brew" -l)" "$(printf '%s\n' 'tap "a/b"' 'brew "git"' 'brew "grep"' 'cask "iterm2"' 'manual "Some')"   # cut at the first blank: what it does today
+}
+rt_brew_L() {
+  _rt_check "brew -L: the commented-out entries, '# manual' ones excluded" \
+    "$("$T/wf.brew" -L | grep -c 'brew "old"')/$("$T/wf.brew" -L | grep -c manual)" "1/0"
+}
+rt_brew_o() {
+  : > "$T/brew.log"
+  _rt_out=$("$T/wf.brew" -o)
+  _rt_check "brew -o: runs 'brew bundle --file=<keep list> --verbose cleanup'" \
+    "$(cat "$T/brew.log")" "bundle --file=$T/keep --verbose cleanup"
+  _rt_check "brew -o: brew's answer is passed through" "$_rt_out" "Would uninstall formulae:${NL}stray"
+  _rt_check "brew -o: the keep list it reads is the world file's" "$(cat "$T/keep.seen")" "$("$T/wf.brew" -R)"
+}
+rt_fedora_o() {
+  # installed: an image package marked "User" (basesystem), an image dependency (bash), a later
+  # dependency (libfoo), one in the world file (zsh), a '# manual' one (my-local-tool) -- and one
+  # installed by hand and listed nowhere (mmv): only mmv is installed ON TOP of the world file
+  printf '%s\n' 'zsh   # shell' '# vim-enhanced' '# manual my-local-tool  # a local rpm' > "$T/world.fedora"
+  _rt_check "fedora -o: only what was installed by hand and is in no list" \
+    "$(WORLDFILE_CONFIG=$T/conf.fedora.o "$T/wf" -o 2>"$T/e")" mmv
+  _rt_check "fedora -o: dnf's chatter on stderr is shown only when dnf fails" "$(cat "$T/e")" ""
+}
+rt_fedora_o_dnf_fails() {
+  _rt_out=$(DNF_STUB_FAIL=1 WORLDFILE_CONFIG=$T/conf.fedora.o "$T/wf" -o 2>&1); _rt_rc=$?
+  _rt_check "fedora -o: a failing dnf is an error, never an empty answer" \
+    "$_rt_rc/$(echo "$_rt_out" | grep -c "FAILED \[1\] .*repoquery")" "1/1"
+}
+rt_detect_macos() {
+  _rt_check "DISTRO empty: macOS is brew"                   "$(_rt_distro Darwin 'ID=fedora')" brew
+}
+rt_detect_fedora() {
+  _rt_check "DISTRO empty: Linux, os-release ID=fedora"     "$(_rt_distro Linux 'NAME="Fedora Linux"' 'ID=fedora')" fedora
+}
+rt_detect_like() {
+  _rt_check "DISTRO empty: an unknown ID, a known ID_LIKE"  "$(_rt_distro Linux 'ID=rocky' 'ID_LIKE="rhel centos fedora"')" fedora
+  _rt_check "DISTRO empty: opensuse-* is opensuse"          "$(_rt_distro Linux 'ID="opensuse-tumbleweed"')" opensuse
+}
+rt_detect_unknown() {
+  echo Linux > "$T/uname"; printf 'ID=gentoo\n' > "$T/os-release"
+  _rt_out=$(WORLDFILE_CONFIG=$T/conf.empty "$T/wf" -R 2>&1); _rt_rc=$?
+  echo Darwin > "$T/uname"
+  _rt_check "DISTRO empty, no known ID: fails, naming the ID it read" \
+    "$_rt_rc/$(echo "$_rt_out" | grep -c "no known ID in '$T/os-release' (ID=gentoo ID_LIKE=)")" "1/1"
+}
+rt_config_wins() {
+  printf 'DISTRO=arch\nWORLDFILE="%s/world"\n' "$T" > "$T/conf.arch"
+  _rt_check "DISTRO in the config beats detection (macOS)" \
+    "$(WORLDFILE_CONFIG=$T/conf.arch "$T/wf" -D -R 2>&1 | sed -n "s/^DISTRO='\(.*\)'$/\1/p")" arch
+  _rt_check "--config FILE is read too" \
+    "$("$T/wf" --config "$T/conf.arch" -D -R 2>&1 | sed -n "s/^DISTRO='\(.*\)'$/\1/p")" arch
+}
+rt_create_config() {
+  _rt_check "--create-config prints the defaults" "$("$T/wf" --create-config | grep -c '^WORLDFILE="/etc/package-list"$')" 1
+  "$T/wf" --create-config "$T/new.conf" >/dev/null
+  _rt_check "--create-config FILE writes them"   "$(cat "$T/new.conf")" "$("$T/wf" --create-config)"
+  _rt_out=$("$T/wf" --create-config="$T/new.conf" 2>&1); _rt_rc=$?
+  _rt_check "...and never over an existing file" "$_rt_rc/$(echo "$_rt_out" | grep -c 'exists already')" "1/1"
+}
+rt_plain_sh() {
+  _rt_check "runs the same under plain sh as under its dash" \
+    "$(WORLDFILE_CONFIG=$T/conf.brew sh "$T/wf" -R)" "$("$T/wf.brew" -R)"
+}
+rt_guard() {
+  _rt_check "every rt_ test function is in the run list" \
+    "$(awk '/^rt_[a-zA-Z_]*\(\) \{/ { c++ } END { print c+0 }' "$B")" "$_rt_tot"
+}
+
+}
+
+run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
+  # the run list: each name NAME is the test function rt_NAME, run in this order
+  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails detect_macos detect_fedora detect_like detect_unknown config_wins create_config plain_sh guard"
+  _rt_tot=0; _rt_n=0; _rt_sel=
+  for _rt_a in $_rt_all; do
+    _rt_tot=$((_rt_tot+1))
+    case "$_rt_a" in *"$1"*) _rt_n=$((_rt_n+1)); _rt_sel="$_rt_sel $_rt_a" ;; esac
+  done
+  [ "$_rt_n" -gt 0 ] || err "--run-tests: no test name contains '$1' (tests: $_rt_all)"
+
+  B=$(_rt_self) || err "--run-tests: cannot resolve the real path of '$0'"
+  T=$(mktemp -d /tmp/worldfile-tests.XXXXXX) || err "--run-tests: mktemp -d failed"
+  trap 'rm -rf "$T"' 0
+  mkdir "$T/bin"
+  # shellcheck disable=SC2016  # the stub's $* must expand when IT runs
+  printf '#!/bin/sh\necho "$*" >> "%s/brew.log"\nfor a; do case "$a" in --file=*) cat "${a#--file=}" > "%s/keep.seen" ;; esac; done\nprintf "Would uninstall formulae:\\nstray\\n"\n' "$T" "$T" > "$T/bin/brew"
+  chmod 700 "$T/bin/brew"
+  printf '%s\n' '#### SECTION' 'brew "grep"   # why' 'tap "a/b"' '  brew "git"' '# brew "old"' 'cask "iterm2"' '' '# manual "Some App"' > "$T/world"
+  echo Darwin > "$T/uname"; _rt_copy
+  # dnf5 as Fedora's: --installed and --userinstalled refuse each other, a dependency is installed
+  # but not user-installed, and 'history info' lists NEVRAs under a header
+  cat > "$T/bin/dnf5" <<'_EOF'
+#!/bin/sh
+echo "Updating and loading repositories:" >&2
+case "$*" in
+  *--installed*--userinstalled*|*--userinstalled*--installed*) echo "Option --userinstalled conflicts with --installed" >&2; exit 2 ;;
+  "repoquery --userinstalled --qf %{name}\n") [ -n "$DNF_STUB_FAIL" ] && exit 1; printf '%s\n' zsh mmv basesystem my-local-tool ;;
+  "repoquery --installed --qf %{name}\n")     printf '%s\n' zsh mmv basesystem my-local-tool bash libfoo ;;
+  "history info 1 2")
+    printf '%s\n' 'Transaction ID : 1' 'Description    : dnf5 --config /kiwi_dnf5.conf install basesystem' 'Packages altered:' \
+      '  Action  Package                            Reason      Repository' \
+      '  Install basesystem-0:11-22.fc42.noarch     User        fbf5' \
+      '  Install bash-0:5.2.37-1.fc42.x86_64        Dependency  fbf5' ;;
+  *) echo "dnf5 stub: unexpected '$*'" >&2; exit 9 ;;
+esac
+_EOF
+  chmod 700 "$T/bin/dnf5"
+  printf 'DISTRO=fedora\nWORLDFILE="%s/world.fedora"\nc_DNF=%s/bin/dnf5\n' "$T" "$T" > "$T/conf.fedora.o"
+
+  # TAP-style: "1..N" first, then "ok K - name" / "not ok K - name" as each test ends;
+  # a test failed when the failure counter grew during it
+  _rt_pass=0; _rt_fail=0; _rt_k=0
+  echo "1..$_rt_n"
+  for _rt_a in $_rt_sel; do
+    _rt_k=$((_rt_k+1)); _rt_bad=$_rt_fail
+    "rt_$_rt_a"
+    if [ "$_rt_fail" = "$_rt_bad" ]; then echo "ok $_rt_k - $_rt_a"; else echo "not ok $_rt_k - $_rt_a"; fi
+  done
+
+  echo " >>> self-test: $_rt_pass passed, $_rt_fail failed"
+  [ "$_rt_fail" -eq 0 ]
+}
+
+[ "$1" = "--run-tests" ] && { shift; run_tests "$1"; exit $?; } # before anything that touches the machine
+
+
+##########################################################################################################
+####  M A I N
+##########################################################################################################
+
+
+##########################################################################################################
+#### PREPARE THINGS: (without doing anything ;) ... except "FOR DEBUGGING PURPOSES", see the $arg loop below!!
+[ $DBG ] && echo "\$@ = \"$@\"" 1>&2
+
+case "$1" in
+    --create-config)   create_config "$2"; exit 0 ;;
+    --create-config=*) create_config "${1#--create-config=}"; exit 0 ;;
+esac
+
+# the config before anything else: every command reads it, and -d runs inside the argument loop
+_cfg=; _prev=
+for a in "$@"; do
+    [ "$_prev" = --config ] && _cfg=$a
+    case "$a" in --config=*) _cfg=${a#--config=} ;; esac
+    _prev=$a
+done
+[ "$_prev" = --config ] && err "--config needs a FILE"
+load_config "$_cfg"
+
+# KEEPFILE: ( == stripped worldfile with only packagenames)
+if [ -z "$KEEPFILE" ]; then case "$DISTRO" in
+    fedora) KEEPFILE=$(new_tempfile); TEMPFILES="$TEMPFILES $KEEPFILE"; ;; # read by this run only, so no root needed
+    *)      KEEPFILE=/var/cache/worldfile/$DISTRO.keeplist; ;;
+esac; fi
+
+# check for valid DISTRO:
+case $DISTRO in
+    #brew) [ $EUID -eq 0 ] && err "Please do NOT run as root on MacOS (brew)!";;
+    fedora|arch|brew|debian|opensuse) ;;
+    *) err "Unsupported DISTRO '$DISTRO'"; ;;
+esac
+
+[ $# -eq 0 ] && usage;
+
+# set up the trap for a clean exit:
+for i in 0 1 2 3 4 5 6 7 8 9; do trap "_cleanup_ \"TRAP\" $i;" $i; done;
+
+# IMPLICITELY make sure to update keepfile if necessary for selected command! == XX_HERE_XX_4711
+for a in "$@"; do
+    case "$a" in
+        -m|-M|-l|-ll|-o|-oo|-O|-do|-doo) flag_rebuildKeepfile=1; ;;
+        -D|--debug) DBG=1; ;;
+    esac;
+done
+
+# check commandline parameter:
+cmd=; # "what" should be done - the (one) command that should be executed!
+while [ $# -gt 0 ]; do
+
+    arg=$1
+    shift;
+    [ $DBG ] && echo "    arg='$arg' - cmd='$dmd'" 1>&2
+
+    case $arg in
+        -D|--debug) DBG=1; ;;
+        --purge) flag_PURGE=1; ;;
+        --config) shift; ;; # read before the loop
+        --config=*) ;;
+
+        -ll) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_worldfile"; flag_nicifyPackagelist=1; ;;
+        -l)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_worldfile"; ;;
+        -l[0-9]|-l[0-9]-[1-9])  
+             [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_worldfile";
+                                                               flag_filterByLeadingSpaces=$(echo $arg|sed -e 's/^-l//'|tr - ,); ;;
+        -LL) err "Not supported. Use -ll instead."; ;;
+        -L)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_worldfile_comments"; ;;
+
+        -ii) err "No nicify possible for /invalid/ packages ;)"; ;;
+        -i)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_invalid_worldfile_entries"; ;;
+        -II) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_valid_worldfile_entries"; flag_nicifyPackagelist=1; ;;
+        -I)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_valid_worldfile_entries"; ;;
+
+        -mm) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_missingPackages"; flag_nicifyPackagelist=1; ;;
+        -m)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_missingPackages"; ;;
+        -M)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="install_missingPackages"; ;;
+
+        -cc) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_commentedPackages_to_be_removed"; flag_nicifyPackagelist=1; ;;
+        -c)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_commentedPackages_to_be_removed"; ;;
+        -C)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="remove_commentedPackages"; ;;
+
+        -oo) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_orphanedPackages"; flag_nicifyPackagelist=1; ;;
+        -o)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_orphanedPackages"; ;;
+        -O)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="remove_orphanedPackages"; ;;
+
+        -s) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_sections"; ;;
+
+        # FOR DEBUGGING PURPOSES:
+        -d)  diff_between_worlfile_and_packageManager vimdiff; ;;
+        #-D) diff_between_worlfile_and_packageManager "comm -123"; ;;
+
+        -r)  flag_rebuildKeepfile=1; ;; # force rebuilding the keepfile
+        -R)  [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="rebuild_keepfile_to_stdout"; ;;
+
+        -doo)[ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_distro_orphanedPackages"; flag_nicifyPackagelist=1; ;;
+        -do) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_distro_orphanedPackages"; ;;
+        -dO) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="remove_distro_orphanedPackages"; ;;
+
+        *) usage; ;;
+    esac;
+done
+
+[ $flag_PURGE ] && case "$DISTRO" in 
+    fedora|arch) err "--purge not yet implemented for this DISTRO ($DISTRO)!"
+esac
+case "$DISTRO" in
+  brew)
+    c_brew=$c_BREW
+    [ -z "$c_brew" ] && for c_brew in /opt/homebrew/bin/brew /usr/local/bin/brew ""; do [ -x "$c_brew" ] && break; done
+    [ -x "$c_brew" ] || err "no brew found (c_BREW='$c_BREW', /opt/homebrew/bin/brew, /usr/local/bin/brew)"
+    ;;
+esac
+
+if [ $DBG ]; then
+    echo "" 1>&2;
+    echo "flag_rebuildKeepfile='$flag_rebuildKeepfile'" 1>&2
+    echo "flag_nicifyPackagelist='$flag_nicifyPackagelist'" 1>&2
+    echo "flag_PURGE='$flag_PURGE'" 1>&2;  # will be handled WITHIN each remove function!
+    echo "DISTRO='$DISTRO'" 1>&2
+    echo "WORLDFILE='$WORLDFILE'" 1>&2
+    echo "KEEPFILE='$KEEPFILE'" 1>&2
+    echo 1>&2;
+    echo "cmd='$cmd'" 1>&2
+    echo 1>&2;
+fi;
+
+###########################################################################################
+### DO THINGS:
+
+[ $flag_rebuildKeepfile ] && { rebuild_keepfile || err "Failed to rebuild keepfile (= temporary, stripped version of the worldfile)!"; }
+
+if [ $flag_nicifyPackagelist ]; then
+    #$cmd|nicifyPackagelist;
+    $cmd >/tmp/a; cat /tmp/a|nicifyPackagelist;
+else
+    $cmd;
+fi;
+
