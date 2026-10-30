@@ -16,8 +16,16 @@ default_config_content() {
 # else the ID (or ID_LIKE) in /etc/os-release
 DISTRO=
 
-# the world file: the packages this machine should have
-WORLDFILE="/etc/package-list"
+# the world file: the packages this machine should have; empty = /etc/package-list.<os>, <os> one
+# token per distribution: macos on macOS, else the ID in /etc/os-release as it stands (fedora, arch, ...)
+WORLDFILE=
+
+# the command that prints this machine's tier, the word alone -- asked only when an entry's selector
+# names a %TIER; empty = such an entry is an error
+TIER_COMMAND=
+
+# the tiers a %TIER may name; empty = any word (a misspelt tier then matches no machine, silently)
+TIERS=
 
 # the keep list: the world file stripped to package names, rebuilt by every command that needs it
 # (brew keeps its Brewfile.lock.json beside it); empty = /var/cache/worldfile/<DISTRO>.keeplist,
@@ -42,6 +50,7 @@ _EOF
 
 NL="
 "
+TAB=$(printf '\t')
 
 # The following flags COULD be globally forced to be SET here... but usually they are set by other mechanisms!
     flag_rebuildKeepfile=;   # option that will be autodetermined (see XX_HERE_XX_4711)
@@ -68,6 +77,12 @@ Everything behind a '#' is considered as a comment (so whole lines, or end-of li
 We do allow a space limited list of packages in one line in the worldfile!
 (they will be split and listed each in their own line in the KEEPFILE)
 
+An entry's comment may END with a SELECTOR -- the machines the entry is for -- and then a SET-UP:
+    brew \"syncthing\"   # file sync  %DESKTOP+@myhost  setup: syncthing-setup --install
+A selector is %TIER (TIER_COMMAND says this machine's) or @host (hostname -s), then +TERM (add)
+or -TERM (remove), read left to right; no selector = every machine. Every command reads only the
+lines whose selector names this machine. The set-up runs with -U, once the package is installed.
+
 _______________________________________________________________________________________________________
 
 COMMANDS:
@@ -93,6 +108,11 @@ COMMANDS:
     -O  == REMOVE  \"orphaned packages\" NOT claimed by the worldfile (or its dependencies) [w. question to confirm!!!]
 
     -s  == list    \"sections\" from worldfile (lines starting with \"###\") -- in the original order -- into less!
+
+    -u  == list    \"set-ups\" of this machine's entries: ENTRY<tab>COMMAND, in order, each COMMAND once
+    -U  == RUN     the set-ups whose package is installed (the others are named, skipped); one that
+                   fails does not stop the rest. A set-up runs on EVERY -U: it must change nothing
+                   when it is in place already
 
     --create-config [FILE] == print the default config, or write it to FILE (never over an existing one)
     --run-tests [FILTER]   == run the self-tests whose name contains FILTER (all without one)
@@ -191,6 +211,7 @@ load_config() { # load_config [FILE] -- the defaults, then FILE ($WORLDFILE_CONF
         . "$_cf" || err "the config '$_cf' failed"
     fi
     [ -n "$DISTRO" ] || detect_distro
+    [ -n "$WORLDFILE" ] || { os_token; WORLDFILE=/etc/package-list.$WF_OS; }
 }
 
 detect_distro() { # sets DISTRO to what this machine runs: brew on macOS, else the first known ID / ID_LIKE of os-release
@@ -207,6 +228,85 @@ detect_distro() { # sets DISTRO to what this machine runs: brew on macOS, else t
     err "cannot detect DISTRO: no known ID in '$OS_RELEASE' ($(. "$OS_RELEASE"; echo "ID=$ID ID_LIKE=$ID_LIKE")) -- set DISTRO in the config"
 }
 OS_RELEASE=/etc/os-release
+
+os_token() { # sets WF_OS to this machine's distribution, one token: macos on macOS, else os-release's ID as it stands
+    [ "$(uname -s)" = Darwin ] && { WF_OS=macos; return 0; }
+    [ -r "$OS_RELEASE" ] || err "cannot name the distribution: '$OS_RELEASE' is missing -- set WORLDFILE in the config"
+    # shellcheck disable=SC1090  # os-release, as above
+    WF_OS=$(. "$OS_RELEASE"; echo "$ID")
+    [ -n "$WF_OS" ] || err "cannot name the distribution: no ID in '$OS_RELEASE' -- set WORLDFILE in the config"
+}
+
+# A world-file line may end its comment with a SELECTOR -- the machines it is for -- and then a
+# set-up: 'brew "syncthing"  # file sync %DESKTOP+@myhost  setup: syncthing-setup --install'. A selector
+# is %TIER or @host, then +TERM (add) or -TERM (remove), read left to right; no selector = every
+# machine. A line whose selector does not name this machine is not in this machine's world file.
+world_select() { # world_select MODE FILE -- FILE as this machine sees it (WF_TIER, WF_HOST):
+                 #   lines   its lines for this machine, selector and set-up cut off;
+                 #   setups  "ENTRY<tab>COMMAND" for each wanted entry of this machine, each COMMAND once;
+                 #   tier    "tier" when a selector names a %TIER, nothing otherwise
+    awk -v mode="$1" -v tier="$WF_TIER" -v host="$WF_HOST" -v tiers="$TIERS" '
+    function fail(m) { printf "%s line %d: %s\n", FILENAME, FNR, m > "/dev/stderr"; exit 2 }
+    function one(t,   n) {
+        n = substr(t, 2)
+        if (t !~ /^%/) return n == host
+        if (tiers != "" && index(" " tiers " ", " " n " ") == 0) fail("\"" t "\" is no tier (TIERS: " tiers ")")
+        if (tier == "") fail("\"" t "\" needs this machine'"'"'s tier, and TIER_COMMAND is empty (the config)")
+        return n == tier
+    }
+    function selects(s,   i, c, op, from, r, v) { # an operator is always followed by % or @: a "-" in a host name is none
+        op = ""; from = 1
+        for (i = 2; i <= length(s) + 1; i++) {
+            c = substr(s, i, 1)
+            if (i <= length(s) && !(c ~ /[+-]/ && substr(s, i + 1, 1) ~ /[%@]/)) continue
+            r = one(substr(s, from, i - from))
+            v = (op == "") ? r : (op == "+") ? (v || r) : (v && !r)
+            op = c; from = i + 1
+        }
+        return v
+    }
+    {
+        line = $0; sel = ""; setup = ""; h = index(line, "#")
+        if (h) {
+            rest = substr(line, h); cut = length(rest) + 1
+            if (match(rest, /[ \t#]setup:[ \t]/)) {
+                setup = substr(rest, RSTART + RLENGTH); sub(/^[ \t]+/, "", setup); sub(/[ \t]+$/, "", setup)
+                rest = substr(rest, 1, RSTART); cut = RSTART + 1
+            }
+            if (match(rest, /[ \t#][%@][^ \t%@+]+([+-][%@][^ \t%@+]+)*[ \t]*$/)) {
+                sel = substr(rest, RSTART + 1); sub(/[ \t]+$/, "", sel); cut = RSTART + 1
+            }
+            if (sel != "" || setup != "") {
+                line = substr(line, 1, h - 1) substr(rest, 1, cut - 1)
+                sub(/[ \t]+$/, "", line)
+                if (line ~ /(^|[ \t])#$/) { sub(/#$/, "", line); sub(/[ \t]+$/, "", line) }  # the comment held only those
+            }
+        }
+        if (mode == "tier") { if (sel ~ /%/) { print "tier"; exit } next }
+        if (sel != "" && !selects(sel)) next
+        if (mode == "lines") { print line; next }
+        if (setup == "" || (setup in seen)) next
+        entry = line
+        if (entry ~ /^[ \t]*#+[ \t]*manual[ \t]/) sub(/^[ \t]*#+[ \t]*/, "", entry)  # installed by hand: listed
+        else if (entry ~ /^[ \t]*#/) next                                             # commented out: not wanted
+        sub(/[ \t]*#.*/, "", entry); sub(/^[ \t]+/, "", entry); gsub(/[ \t]+/, " ", entry)
+        seen[setup]; print entry "\t" setup
+    }' "$2"
+}
+
+world_here() { # WORLDFILE becomes this machine's lines of it (a temp file); WORLDFILE_SRC keeps the file itself
+    WORLDFILE_SRC=$WORLDFILE
+    [ -r "$WORLDFILE_SRC" ] || return 0      # the command that reads it says so, as before
+    WF_HOST="$(hostname -s)"; WF_TIER=
+    if [ -n "$(world_select tier "$WORLDFILE_SRC")" ]; then
+        [ -n "$TIER_COMMAND" ] || err "'$WORLDFILE_SRC' names a %TIER, and TIER_COMMAND is empty: set it in the config to the command that prints this machine's tier"
+        # shellcheck disable=SC2086  # TIER_COMMAND is a command line
+        WF_TIER=$($TIER_COMMAND) || err "FAILED [$?] TIER_COMMAND '$TIER_COMMAND'"
+        [ -n "$WF_TIER" ] || err "TIER_COMMAND '$TIER_COMMAND' printed no tier"
+    fi
+    WORLDFILE=$(new_tempfile); TEMPFILES="$TEMPFILES $WORLDFILE"
+    world_select lines "$WORLDFILE_SRC" > "$WORLDFILE" || err "cannot read the selectors of '$WORLDFILE_SRC' (above)"
+}
 
 create_config() { # create_config [FILE] -- the default config to stdout, or into FILE when it does not exist yet
     [ -z "$1" ] && { default_config_content; return; }
@@ -511,6 +611,46 @@ list_sections() {
 }
 
 
+is_installed() { local fn=is_installed; # is_installed ENTRY -- exit 0 when the world-file entry is installed
+    case "$1" in manual*) return 0 ;; esac   # installed by hand: nothing to ask, it counts as there
+    # shellcheck disable=SC2086  # an entry may name several packages
+    case $DISTRO in
+        brew) _ii=${1#* \"}; _ii=${_ii%%\"*}
+              case "$1" in
+                  'brew "'*) "$c_brew" list --formula "$_ii" >/dev/null 2>&1 ;;
+                  'cask "'*) "$c_brew" list --cask "$_ii" >/dev/null 2>&1 ;;
+                  'tap "'*)  "$c_brew" tap | grep -qx "$_ii" ;;
+                  *) return 1 ;;
+              esac ;;
+        fedora|opensuse) rpm -q $1 >/dev/null 2>&1 ;;
+        arch)   $c_ARCH -Q $1 >/dev/null 2>&1 ;;
+        debian) dpkg-query -W $1 >/dev/null 2>&1 ;;
+        *) XXXX $DISTRO $fn; ;;
+    esac
+}
+
+list_setups() { # this machine's set-ups: "ENTRY<tab>COMMAND", in world-file order, each command once
+    [ -r "$WORLDFILE_SRC" ] || err "cannot read the world file '$WORLDFILE_SRC'"
+    world_select setups "$WORLDFILE_SRC"
+}
+run_setups() { # each set-up of this machine whose package is installed; 1 when one failed -- a set-up
+               # runs on every -U, so it must change nothing when it is in place already
+    _su=$(new_tempfile); TEMPFILES="$TEMPFILES $_su"
+    list_setups > "$_su" || return 1
+    _su_bad=0
+    while IFS="$TAB" read -r _su_e _su_c <&3; do   # the list on fd 3: a set-up may read stdin
+        if ! is_installed "$_su_e"; then
+            echo " >>> skipped: $_su_c   ($_su_e is not installed: worldfile -M)"; continue
+        fi
+        echo " >>> $_su_c   (the set-up of $_su_e)"
+        sh -c "$_su_c"; _su_rc=$?
+        if [ "$_su_rc" = 0 ]; then echo "    > done [0]"
+        else echo "    > FAILED [$_su_rc] $_su_c" 1>&2; _su_bad=$((_su_bad+1)); fi
+    done 3< "$_su"
+    [ "$_su_bad" = 0 ] || { echo "$_su_bad set-up(s) FAILED" 1>&2; return 1; }
+}
+
+
 rebuild_keepfile() { local fn=rebuild_keepfile;
     if [ -z "$DIRTY" -a "$DISTRO" = "fedora" ]; then
         # for DISTRO=fedora: This is slightly NON-dirtier / cleaner, but SLOWER than the default:
@@ -586,8 +726,9 @@ _rt_check() {
   if [ "$2" = "$3" ]; then echo "  PASS  $1"; _rt_pass=$((_rt_pass+1))
   else printf '  FAIL  %s\n    got:  %s\n    want: %s\n' "$1" "$2" "$3"; _rt_fail=$((_rt_fail+1)); fi
 }
-_rt_copy() { # $T/wf: this file with its keep list in $T, brew = the stub, and uname / os-release read from $T
-  sed -e "s|^OS_RELEASE=.*|OS_RELEASE=$T/os-release|" -e "s|\"\$(uname -s)\"|\"\$(cat $T/uname)\"|" "$B" > "$T/wf"
+_rt_copy() { # $T/wf: this file with its keep list in $T, brew = the stub, and uname / os-release / hostname read from $T
+  sed -e "s|^OS_RELEASE=.*|OS_RELEASE=$T/os-release|" -e "s|\"\$(uname -s)\"|\"\$(cat $T/uname)\"|" \
+      -e "s|\"\$(hostname -s)\"|\"\$(cat $T/hostname)\"|" "$B" > "$T/wf"
   chmod 700 "$T/wf"
   for _rt_d in brew fedora; do # $T/wf.DISTRO: $T/wf with a config setting DISTRO and reading $T/world
     printf 'DISTRO=%s\nWORLDFILE="%s/world"\nKEEPFILE="%s/keep"\nc_BREW="%s/bin/brew"\n' "$_rt_d" "$T" "$T" "$T" > "$T/conf.$_rt_d"
@@ -662,11 +803,64 @@ rt_config_wins() {
     "$("$T/wf" --config "$T/conf.arch" -D -R 2>&1 | sed -n "s/^DISTRO='\(.*\)'$/\1/p")" arch
 }
 rt_create_config() {
-  _rt_check "--create-config prints the defaults" "$("$T/wf" --create-config | grep -c '^WORLDFILE="/etc/package-list"$')" 1
+  _rt_check "--create-config prints the defaults" "$("$T/wf" --create-config | grep -c '^WORLDFILE=$')" 1
   "$T/wf" --create-config "$T/new.conf" >/dev/null
   _rt_check "--create-config FILE writes them"   "$(cat "$T/new.conf")" "$("$T/wf" --create-config)"
   _rt_out=$("$T/wf" --create-config="$T/new.conf" 2>&1); _rt_rc=$?
   _rt_check "...and never over an existing file" "$_rt_rc/$(echo "$_rt_out" | grep -c 'exists already')" "1/1"
+}
+rt_world_per_os() {
+  # WORLDFILE empty: /etc/package-list.<os> -- macos, else os-release's ID AS IT STANDS (never its ID_LIKE)
+  : > "$T/conf.noworld"
+  for _rt_c in "Darwin|ID=fedora|macos" "Linux|ID=fedora|fedora" "Linux|ID=rocky@ID_LIKE=\"rhel fedora\"|rocky" "Linux|ID=arch|arch"; do
+    echo "${_rt_c%%|*}" > "$T/uname"; _rt_r=${_rt_c#*|}
+    printf '%s\n' "${_rt_r%|*}" | tr @ '\n' > "$T/os-release"
+    _rt_check "WORLDFILE empty: ${_rt_c%%|*} ${_rt_r%|*} reads package-list.${_rt_c##*|}" \
+      "$(WORLDFILE_CONFIG=$T/conf.noworld "$T/wf" -D -R 2>&1 | sed -n "s/^WORLDFILE='\(.*\)'$/\1/p")" "/etc/package-list.${_rt_c##*|}"
+  done
+  echo Darwin > "$T/uname"
+}
+rt_select() {
+  # this machine: host my-box, tier MINE; a "-" inside a host name is part of it, never an operator
+  _rt_check "a selector keeps the lines that name this machine, and only those" \
+    "$(WORLDFILE_CONFIG=$T/conf.sel "$T/wf" -R)" "$(printf '%s\n' 'brew "all"' 'brew "both"' 'brew "box"' 'brew "fails"' 'brew "mail"' 'brew "mine"' 'brew "plus"' 'cask "absent"')"
+  _rt_check "-L: a commented-out entry's selector is cut off with it" \
+    "$(WORLDFILE_CONFIG=$T/conf.sel "$T/wf" -L)" "# brew \"gone\""
+}
+rt_select_tier_only_when_needed() {
+  : > "$T/tier.log"
+  { cat "$T/conf.brew"; printf 'TIER_COMMAND="%s/bin/tier"\n' "$T"; } > "$T/conf.brew.tier"
+  _rt_check "no %TIER in the world file: TIER_COMMAND is never run (and the run works)" \
+    "$(WORLDFILE_CONFIG=$T/conf.brew.tier "$T/wf" -R | grep -c .)/$(cat "$T/tier.log")" "4/"
+  WORLDFILE_CONFIG=$T/conf.sel "$T/wf" -R > /dev/null
+  _rt_check "a %TIER in it: TIER_COMMAND is run once" "$(grep -c . "$T/tier.log")" 1
+}
+rt_select_errors() {
+  printf 'WORLDFILE="%s/world.sel"\n' "$T" > "$T/conf.sel.notier"
+  _rt_out=$(WORLDFILE_CONFIG=$T/conf.sel.notier "$T/wf" -R 2>&1); _rt_rc=$?
+  _rt_check "a %TIER with TIER_COMMAND empty: an error naming it, never a silent miss" \
+    "$_rt_rc/$(echo "$_rt_out" | grep -c 'TIER_COMMAND is empty')/$(echo "$_rt_out" | grep -c 'brew')" "1/1/0"
+  printf 'brew "x"  # %%MIME\n' > "$T/world.typo"
+  printf 'WORLDFILE="%s/world.typo"\nTIER_COMMAND="%s/bin/tier"\nTIERS="MINE MAINTAIN FOREIGN"\n' "$T" "$T" > "$T/conf.typo"
+  _rt_out=$(WORLDFILE_CONFIG=$T/conf.typo "$T/wf" -R 2>&1); _rt_rc=$?
+  _rt_check "a misspelt tier: an error naming the line, never a silent miss" \
+    "$_rt_rc/$(echo "$_rt_out" | grep -c 'world.typo line 1: "%MIME" is no tier')" "1/1"
+}
+rt_setup_list() {
+  _rt_check "-u: this machine's set-ups, in order, each command once; none for an unselected or commented-out entry" \
+    "$(WORLDFILE_CONFIG=$T/conf.sel "$T/wf" -u)" "$(printf 'brew "box"\twfs box\nbrew "mine"\tcat >/dev/null; wfs mine\nbrew "plus"\twfs shared\ncask "absent"\twfs absent\nmanual "Tool"\twfs tool\nbrew "fails"\twfs fails; exit 3\n')"
+}
+rt_setup_run() {
+  : > "$T/setup.log"
+  _rt_out=$(WORLDFILE_CONFIG=$T/conf.sel "$T/wf" -U < /dev/null 2>"$T/e"); _rt_rc=$?
+  _rt_check "-U: each installed entry's set-up ran ONCE; a shared one once; the uninstalled one is skipped" \
+    "$(cat "$T/setup.log" | tr '\n' ' ')" "box mine shared tool fails "
+  _rt_check "-U: a set-up that reads stdin does not eat the list (the ones after it still run)" \
+    "$(grep -c '^tool$' "$T/setup.log")" 1
+  _rt_check "-U: the skipped one is named, with why" \
+    "$(echo "$_rt_out" | grep -c 'skipped: wfs absent   (cask "absent" is not installed')" 1
+  _rt_check "-U: a failed set-up fails the run [rc], and says which" \
+    "$_rt_rc/$(grep -c 'FAILED \[3\] wfs fails' "$T/e")" "1/1"
 }
 rt_plain_sh() {
   _rt_check "runs the same under plain sh as under its dash" \
@@ -681,7 +875,7 @@ rt_guard() {
 
 run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
   # the run list: each name NAME is the test function rt_NAME, run in this order
-  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails detect_macos detect_fedora detect_like detect_unknown config_wins create_config plain_sh guard"
+  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails detect_macos detect_fedora detect_like detect_unknown config_wins create_config world_per_os select select_tier_only_when_needed select_errors setup_list setup_run plain_sh guard"
   _rt_tot=0; _rt_n=0; _rt_sel=
   for _rt_a in $_rt_all; do
     _rt_tot=$((_rt_tot+1))
@@ -694,10 +888,22 @@ run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
   trap 'rm -rf "$T"' 0
   mkdir "$T/bin"
   # shellcheck disable=SC2016  # the stub's $* must expand when IT runs
-  printf '#!/bin/sh\necho "$*" >> "%s/brew.log"\nfor a; do case "$a" in --file=*) cat "${a#--file=}" > "%s/keep.seen" ;; esac; done\nprintf "Would uninstall formulae:\\nstray\\n"\n' "$T" "$T" > "$T/bin/brew"
+  printf '#!/bin/sh\ncase "$1" in list) grep -qx "$3" "%s/installed"; exit ;; tap) cat "%s/installed"; exit ;; esac\necho "$*" >> "%s/brew.log"\nfor a; do case "$a" in --file=*) cat "${a#--file=}" > "%s/keep.seen" ;; esac; done\nprintf "Would uninstall formulae:\\nstray\\n"\n' "$T" "$T" "$T" "$T" > "$T/bin/brew"
   chmod 700 "$T/bin/brew"
   printf '%s\n' '#### SECTION' 'brew "grep"   # why' 'tap "a/b"' '  brew "git"' '# brew "old"' 'cask "iterm2"' '' '# manual "Some App"' > "$T/world"
-  echo Darwin > "$T/uname"; _rt_copy
+  echo Darwin > "$T/uname"; echo my-box > "$T/hostname"; _rt_copy
+  # the selector world: this machine is my-box, tier MINE (the stub logs each call)
+  printf '#!/bin/sh\necho called >> "%s/tier.log"\necho MINE\n' "$T" > "$T/bin/tier"; chmod 700 "$T/bin/tier"
+  printf '%s\n' 'brew "all"' 'brew "box"     # @my-box  setup: wfs box' 'brew "other"   # @my-boxer  setup: wfs other' \
+    'brew "mine"    # why %MINE  setup: cat >/dev/null; wfs mine' 'brew "foreign" # %FOREIGN  setup: wfs foreign' \
+    'brew "plus"    # %FOREIGN+@my-box  setup: wfs shared' 'brew "minus"   # %MINE-@my-box' 'brew "both"  # %MINE+@my-box  setup: wfs shared' \
+    'brew "mail"    # ask me@home' '# brew "gone"  # %MINE  setup: wfs gone' 'cask "absent"  # setup: wfs absent' \
+    '# manual "Tool"  # by hand  setup: wfs tool' 'brew "fails"  #setup: wfs fails; exit 3' > "$T/world.sel"
+  printf '%s\n' all box mine plus both fails > "$T/installed"
+  # shellcheck disable=SC2016  # expands when the stub, or the config, runs
+  printf '#!/bin/sh\necho "$1" >> "%s/setup.log"\n' "$T" > "$T/bin/wfs"; chmod 700 "$T/bin/wfs"
+  # shellcheck disable=SC2016  # expands when the stub, or the config, runs
+  printf 'DISTRO=brew\nWORLDFILE="%s/world.sel"\nKEEPFILE="%s/keep.sel"\nc_BREW="%s/bin/brew"\nTIER_COMMAND="%s/bin/tier"\nTIERS="MINE MAINTAIN FOREIGN"\nPATH="%s/bin:$PATH"\n' "$T" "$T" "$T" "$T" "$T" > "$T/conf.sel"
   # dnf5 as Fedora's: --installed and --userinstalled refuse each other, a dependency is installed
   # but not user-installed, and 'history info' lists NEVRAs under a header
   cat > "$T/bin/dnf5" <<'_EOF'
@@ -777,6 +983,8 @@ esac
 # set up the trap for a clean exit:
 for i in 0 1 2 3 4 5 6 7 8 9; do trap "_cleanup_ \"TRAP\" $i;" $i; done;
 
+world_here   # every command reads this machine's lines of the world file
+
 # IMPLICITELY make sure to update keepfile if necessary for selected command! == XX_HERE_XX_4711
 for a in "$@"; do
     case "$a" in
@@ -826,6 +1034,9 @@ while [ $# -gt 0 ]; do
 
         -s) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_sections"; ;;
 
+        -u) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="list_setups"; ;;
+        -U) [ -n "$cmd" ] && err "Only one COMMAND possible"; cmd="run_setups"; ;;
+
         # FOR DEBUGGING PURPOSES:
         -d)  diff_between_worlfile_and_packageManager vimdiff; ;;
         #-D) diff_between_worlfile_and_packageManager "comm -123"; ;;
@@ -858,7 +1069,8 @@ if [ $DBG ]; then
     echo "flag_nicifyPackagelist='$flag_nicifyPackagelist'" 1>&2
     echo "flag_PURGE='$flag_PURGE'" 1>&2;  # will be handled WITHIN each remove function!
     echo "DISTRO='$DISTRO'" 1>&2
-    echo "WORLDFILE='$WORLDFILE'" 1>&2
+    echo "WORLDFILE='$WORLDFILE_SRC'" 1>&2
+    echo "this machine: host '$WF_HOST', tier '$WF_TIER' (asked only for a %TIER): its lines in '$WORLDFILE'" 1>&2
     echo "KEEPFILE='$KEEPFILE'" 1>&2
     echo 1>&2;
     echo "cmd='$cmd'" 1>&2

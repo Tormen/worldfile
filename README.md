@@ -10,6 +10,8 @@ zypper (openSUSE).
     worldfile -o     # installed on top of the world file
     worldfile -O     # ...remove them (asks first)
     worldfile -l     # the world file's packages
+    worldfile -u     # this machine's set-ups
+    worldfile -U     # ...run those whose package is installed
     worldfile -h     # every command
 
 Not every command exists for every package manager yet; one that does not
@@ -25,6 +27,33 @@ NOT be there (`worldfile -c` lists those still installed). `# manual <name>`
 records something installed by hand, outside the package manager: it counts
 as listed.
 
+There is one world file per distribution: `package-list.<os>`, where `<os>` is
+`macos` on macOS, else the `ID` of `/etc/os-release` as it stands (`fedora`,
+`arch`, `debian`).
+
+### Which machines: the selector
+
+An entry's comment may end with a *selector*, then a *set-up*:
+
+    brew "syncthing"   # file sync  %DESKTOP+@myhost  setup: syncthing-setup --install
+
+A selector is `%TIER` or `@host`, followed by `+TERM` (add) or `-TERM`
+(remove), read left to right: `%DESKTOP-@myhost` is every DESKTOP machine but
+myhost. No selector = every machine. `@host` is `hostname -s`; this machine's
+tier is what `TIER_COMMAND` prints, asked only when an entry names a `%TIER`.
+Every command reads only the lines whose selector names this machine. A `%TIER`
+with `TIER_COMMAND` empty, or one that `TIERS` does not list, is an error
+naming the line -- never a silent miss.
+
+### The set-up
+
+`setup: <command>` runs with `worldfile -U`, once the entry's package is
+installed (an entry that is not is named and skipped; `# manual` ones count
+as installed). It runs on every `-U`, so it must change nothing when it is in
+place already -- a second `-U` is then a no-op. A command shared by several
+entries runs once; one that fails does not stop the rest, and `-U` exits 1.
+`worldfile -u` lists them: `ENTRY<tab>COMMAND`.
+
 ## What `-o` compares
 
 - **brew** -- `brew bundle cleanup` against the world file.
@@ -39,7 +68,9 @@ as listed.
 ## Configuration
 
 Optional: without a config file the defaults apply, and `DISTRO` is detected
--- brew on macOS, else the `ID` / `ID_LIKE` of `/etc/os-release`.
+-- brew on macOS, else the `ID` / `ID_LIKE` of `/etc/os-release`. `WORLDFILE`
+empty is `/etc/package-list.<os>`; `TIER_COMMAND` (this machine's tier) and
+`TIERS` (the tiers a selector may name) are needed only by `%TIER` selectors.
 
     worldfile --create-config                      # every setting, with its default
     worldfile --create-config /etc/worldfile.conf  # ...written to a file (never over one)
