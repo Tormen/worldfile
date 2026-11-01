@@ -360,8 +360,9 @@ nicifyPackagelist() { local fn=nicifyPackagelist;
 
 
 _cleanup_() {
+    _cu_rc=$?   # the status the trap came with: read before any command replaces it
     [ $CLEANUP_DONE ] && return;
-    [ $DBG ] && { echo; echo "CLEANUP! ($?) [$*]"; } 1>&2;
+    [ $DBG ] && { echo; echo "CLEANUP! ($_cu_rc) [$*]"; } 1>&2;
     [ -n "$TEMPFILES" ] && rm -f $TEMPFILES;
     CLEANUP_DONE=1
     exit;
