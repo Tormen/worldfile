@@ -430,6 +430,20 @@ list_dnf() { # list_dnf FILE ARGS... -- "$c_DNF" ARGS into FILE; its stderr is s
     _ld_rc=$?; cat "$_ld_f.err" 1>&2; err 015 "FAILED [$_ld_rc] $c_DNF $*"
 }
 
+fedora_missing() { # the world file's packages (its keep list) that dnf has not installed, one name per line
+    _fm=$(new_tempfile); TEMPFILES="$TEMPFILES $_fm $_fm.err"
+    list_dnf "$_fm" repoquery --installed --qf '%{name}\n'
+    LC_ALL=C sort -u "$_fm" -o "$_fm"
+    LC_ALL=C sort -u "$KEEPFILE" | LC_ALL=C comm -23 - "$_fm"
+}
+fedora_commented() { # the commented-out entries ('# NAME', one word: never prose, a section or '# manual') that are installed
+    _fc=$(new_tempfile); TEMPFILES="$TEMPFILES $_fc $_fc.err"
+    list_dnf "$_fc" repoquery --installed --qf '%{name}\n'
+    LC_ALL=C sort -u "$_fc" -o "$_fc"
+    sed -n 's/^[[:space:]]*#[[:space:]]*\([^#[:space:]][^[:space:]]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' "$WORLDFILE" \
+        | grep -vx 'manual' | LC_ALL=C sort -u | LC_ALL=C comm -12 - "$_fc"
+}
+
 list_orphanedPackages() { local fn=list_orphanedPackages;
     case $DISTRO in
         fedora) # what dnf records as installed on purpose, minus what the image installed, minus the world
@@ -463,7 +477,8 @@ list_orphanedPackages() { local fn=list_orphanedPackages;
 remove_orphanedPackages() { local fn=remove_orphanedPackages;
     if [ "$DISTRO" != "brew" ]; then tmp="$( $0 -o )"; [ -z "$tmp" ] && return; fi # nothing to do
     case $DISTRO in
-        fedora) yum remove $tmp; ;;
+        fedora) # shellcheck disable=SC2086  # a list of names
+                "$c_DNF" remove $tmp; ;;
         brew) [ $DBG ] && echo "   \"$c_brew\" bundle --file="$KEEPFILE" --verbose --force cleanup" 1>&2;
               "$c_brew" bundle --file="$KEEPFILE" --verbose --force cleanup ;;
         arch) $c_ARCH -R --nosave --recursive --unneeded $tmp; ;;  # == $c_ARCH -Rcsu
@@ -477,7 +492,8 @@ remove_orphanedPackages() { local fn=remove_orphanedPackages;
 
 list_distro_orphanedPackages() { local fn=list_distro_orphanedPackages;
     case $DISTRO in
-        fedora) rpmorphan -dry-run -all; ;;
+        fedora) _do=$(new_tempfile); TEMPFILES="$TEMPFILES $_do $_do.err"
+                list_dnf "$_do" repoquery --unneeded --qf '%{name}\n'; LC_ALL=C sort -u "$_do"; ;;   # what autoremove would remove
         #arch)   $c_ARCH -Q --deps --unrequired; ;; # == $c_ARCH -Qdt
         arch)  
             tmp=$( $c_ARCH -Q --deps --unrequired| xargs echo );
@@ -488,7 +504,7 @@ list_distro_orphanedPackages() { local fn=list_distro_orphanedPackages;
 }
 remove_distro_orphanedPackages() { local fn=remove_distro_orphanedPackages;
     case $DISTRO in
-        fedora) yum remove $( $0 -o ); ;;
+        fedora) "$c_DNF" autoremove; ;;
         arch)
             tmp=$( $c_ARCH -Q --deps --unrequired| xargs echo );
             [ -n "$tmp" ] && $c_ARCH -R --cascade --recursive --unneeded $tmp; ;;  # == $c_ARCH -Rcsu
@@ -504,7 +520,7 @@ list_missingPackages() { local fn=list_missingPackages;
             [ $DBG ] && echo "DBG: list_missingPackages(): \"$c_brew\" bundle --file=\"$KEEPFILE\" check --verbose -- its answer, unfiltered, on stderr" 1>&2
             "$c_brew" bundle --file="$KEEPFILE" check --verbose|{ if [ $DBG ]; then tee /dev/stderr; else cat; fi; }|grep -v "^The Brewfile's dependencies are satisfied.\|\"$c_brew\" bundle can't satisfy your .* dependencies.\|Satisfy missing dependencies with .*"|sed -e 's/→ Formula \(.*\) needs to be installed or updated./brew "\1"/'|sed -e 's/→ Cask \(.*\) needs to be installed or updated./cask "\1"/'|sed -e 's/→ Tap \(.*\) needs to be tapped./tap "\1"/'
             ;;
-        fedora) $0 -l|xargs yum install|grep -v 'already installed and latest version'; ;;
+        fedora) fedora_missing; ;;
         arch) 
             ### Filter all non-installed packages (including groups):
             # -Q only works on INSTALLED stuff !!
@@ -549,7 +565,8 @@ install_missingPackages() { local fn=install_missingPackages;
     [ -z "$tmp" ] && return; # nothing to do
 
     case $DISTRO in
-        fedora) yum install $tmp; ;; # yum install $( $0 -l )|grep -v 'already installed and latest version'; ;;
+        fedora) # shellcheck disable=SC2086  # a list of names
+                "$c_DNF" install $tmp; ;;   # dnf shows them and asks
         brew)
             local taps="$(echo "$tmp"|sed -n 's/^.* [tT][aA][pP] \(.*\) needs to be tapped.*$/\1/p')";
             local formulae="$(echo "$tmp"|sed -n -e 's/^.* [bB][rR][eE][wW] \(.*\) needs to be installed.*$/\1/p' -e 's/^.* Formula \(.*\) needs to be installed.*$/\1/p')";
@@ -577,7 +594,7 @@ list_commentedPackages_to_be_removed() { local fn=list_commentedPackages_to_be_r
     tmp="$( $0 -L )"
     [ -z "$tmp" ] && return; # nothing to do
     case $DISTRO in
-        fedora) yum remove --dry-run $tmp; ;;
+        fedora) fedora_commented; ;;
         arch)  $c_ARCH -R --cascade --recursive --unneeded --print $tmp; ;; 
         debian) XXXX debian $fn; ;;
         *) XXXX $DISTRO $fn; ;;
@@ -587,7 +604,9 @@ remove_commentedPackages() { local fn=remove_commentedPackages;
     tmp="$( $0 -L )"
     [ -z "$tmp" ] && return; # nothing to do
     case $DISTRO in
-        fedora) yum remove $tmp; ;;
+        fedora) tmp=$(fedora_commented | xargs)
+                # shellcheck disable=SC2086  # a list of names
+                [ -n "$tmp" ] && "$c_DNF" remove $tmp; ;;   # dnf shows them and asks
         arch)
             tmpFile=$(new_tempfile);
             TEMPFILES="$TEMPFILES $tmpFile"
@@ -882,6 +901,20 @@ rt_R_split() {
   _rt_check "-R: arch's repo/name entries give the names, one per line" \
     "$(WORLDFILE_CONFIG=$T/conf.arch.R "$T/wf" -R | tr '\n' ' ')" "gvim yay zsh "
 }
+rt_fedora_dnf() {
+  # installed: zsh mmv basesystem my-local-tool bash libfoo (the dnf5 stub); no yum anywhere
+  printf '%s\n' 'zsh' 'git   # not installed' '# mmv' '# basesystem is the image   <- prose, never a package' \
+    '#### SECTION' '# manual my-local-tool' > "$T/world.dnf"
+  printf 'DISTRO=fedora\nWORLDFILE="%s/world.dnf"\nc_DNF=%s/bin/dnf5\n' "$T" "$T" > "$T/conf.dnf"
+  : > "$T/dnf.log"
+  _rt_c() { DNF_LOG=$T/dnf.log WORLDFILE_CONFIG=$T/conf.dnf "$T/wf" "$@" < /dev/null 2>&1 | grep -v '^ + Missing' | tr '\n' ' '; }
+  _rt_check "fedora -m: the world file's packages not installed"            "$(_rt_c -m)" "git "
+  _rt_check "fedora -c: commented-out ONE-word entries that are installed"  "$(_rt_c -c)" "mmv "
+  _rt_check "fedora -do: what dnf would autoremove"                          "$(_rt_c -do)" "libfoo "
+  _rt_c -M >/dev/null; _rt_c -C >/dev/null; _rt_c -O >/dev/null; _rt_c -dO >/dev/null
+  _rt_check "fedora -M -C -O -dO: dnf install / remove / autoremove, the names listed" \
+    "$(tr '\n' '|' < "$T/dnf.log")" "install git|remove mmv|remove mmv|autoremove|"
+}
 rt_plain_sh() {
   _rt_check "runs the same under plain sh as under its dash" \
     "$(WORLDFILE_CONFIG=$T/conf.brew sh "$T/wf" -R)" "$("$T/wf.brew" -R)"
@@ -895,7 +928,7 @@ rt_guard() {
 
 run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
   # the run list: each name NAME is the test function rt_NAME, run in this order
-  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails detect_macos detect_fedora detect_like detect_unknown config_wins create_config err_stderr debug_stdout R_split world_per_os select select_tier_only_when_needed select_errors setup_list setup_run plain_sh guard"
+  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails fedora_dnf detect_macos detect_fedora detect_like detect_unknown config_wins create_config err_stderr debug_stdout R_split world_per_os select select_tier_only_when_needed select_errors setup_list setup_run plain_sh guard"
   _rt_tot=0; _rt_n=0; _rt_sel=
   for _rt_a in $_rt_all; do
     _rt_tot=$((_rt_tot+1))
@@ -933,6 +966,8 @@ case "$*" in
   *--installed*--userinstalled*|*--userinstalled*--installed*) echo "Option --userinstalled conflicts with --installed" >&2; exit 2 ;;
   "repoquery --userinstalled --qf %{name}\n") [ -n "$DNF_STUB_FAIL" ] && exit 1; printf '%s\n' zsh mmv basesystem my-local-tool ;;
   "repoquery --installed --qf %{name}\n")     printf '%s\n' zsh mmv basesystem my-local-tool bash libfoo ;;
+  "repoquery --unneeded --qf %{name}\n")      echo libfoo ;;
+  install\ *|remove\ *|autoremove)             echo "$*" >> "$DNF_LOG" ;;
   "history info 1 2")
     printf '%s\n' 'Transaction ID : 1' 'Description    : dnf5 --config /kiwi_dnf5.conf install basesystem' 'Packages altered:' \
       '  Action  Package                            Reason      Repository' \
