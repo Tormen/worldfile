@@ -656,7 +656,7 @@ rebuild_keepfile() { local fn=rebuild_keepfile;
     fi
 }
 rebuild_keepfile_to_stdout() { local fn=rebuild_keepfile_to_stdout;
-  # we DO allow space separated list of multiple packes in one line! -->  -e"s/ /\n/g" to split them :)
+  # a line may name several packages, separated by blanks: one per line here
   case "$DISTRO" in
     brew)
       tmpFile=$(new_tempfile); TEMPFILES="$TEMPFILES $tmpFile";
@@ -670,10 +670,10 @@ rebuild_keepfile_to_stdout() { local fn=rebuild_keepfile_to_stdout;
       return 0
       ;;
     arch)
-      cat "$WORLDFILE"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]]*//' -e's/[[:space:]]*$//' -e's|[^[:space:]]\+/\([^[:space:]]\+\)$|\1|' -e"s/ /\n/g"|grep -v '^[[:space:]]*$'|sort|uniq ;; # |while read a; do echo "$a"; done
+      sed 's/#.*//' "$WORLDFILE" | tr -s '[:blank:]' '\n' | sed 's|^.*/||' | grep -v '^$' | sort -u ;;   # repo/name -> name
     *)
       # strip out everything but the pure packagenames from the worldfile:
-      cat "$WORLDFILE"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]]*//' -e's/[[:space:]]*$//' -e"s/ /\n/g"|grep -v '^[[:space:]]*$'|sort|uniq ;;
+      sed 's/#.*//' "$WORLDFILE" | tr -s '[:blank:]' '\n' | grep -v '^$' | sort -u ;;
   esac
 }
 
@@ -872,6 +872,16 @@ rt_debug_stdout() {
       "$("$T/wf.brew" -D "$_rt_c" 2>/dev/null; echo .)" "$("$T/wf.brew" "$_rt_c" 2>/dev/null; echo .)"   # the dot: a trailing blank line counts
   done
 }
+rt_R_split() {
+  printf '%s\n' 'vim-enhanced git   # two on one line' '	mmv' 'zsh' '# gone' > "$T/world.multi"
+  printf 'DISTRO=fedora\nWORLDFILE="%s/world.multi"\n' "$T" > "$T/conf.multi"
+  _rt_check "-R: a line naming several packages gives one per line (fedora)" \
+    "$(WORLDFILE_CONFIG=$T/conf.multi "$T/wf" -R | tr '\n' ' ')" "git mmv vim-enhanced zsh "
+  printf '%s\n' 'extra/gvim aur/yay  # repo/name' 'zsh' > "$T/world.arch"
+  printf 'DISTRO=arch\nWORLDFILE="%s/world.arch"\n' "$T" > "$T/conf.arch.R"
+  _rt_check "-R: arch's repo/name entries give the names, one per line" \
+    "$(WORLDFILE_CONFIG=$T/conf.arch.R "$T/wf" -R | tr '\n' ' ')" "gvim yay zsh "
+}
 rt_plain_sh() {
   _rt_check "runs the same under plain sh as under its dash" \
     "$(WORLDFILE_CONFIG=$T/conf.brew sh "$T/wf" -R)" "$("$T/wf.brew" -R)"
@@ -885,7 +895,7 @@ rt_guard() {
 
 run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
   # the run list: each name NAME is the test function rt_NAME, run in this order
-  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails detect_macos detect_fedora detect_like detect_unknown config_wins create_config err_stderr debug_stdout world_per_os select select_tier_only_when_needed select_errors setup_list setup_run plain_sh guard"
+  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails detect_macos detect_fedora detect_like detect_unknown config_wins create_config err_stderr debug_stdout R_split world_per_os select select_tier_only_when_needed select_errors setup_list setup_run plain_sh guard"
   _rt_tot=0; _rt_n=0; _rt_sel=
   for _rt_a in $_rt_all; do
     _rt_tot=$((_rt_tot+1))
