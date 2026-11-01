@@ -177,11 +177,11 @@ getOK() { local _ASKSTRING=$1;
   while [ 1 ]; do
     printf "$_ASKSTRING";
     read _a;
-    [ $DBG ] && echo "DBG: getOK(): got '$_a'"
+    [ $DBG ] && echo "DBG: getOK(): got '$_a'" 1>&2
     case "$_a" in
-      [yY]|[yY][eE][sS]|[zZ]|[zZ][eE][sS]) [ $DBG ] && echo "DBG: getOK(): return 0 (yes)";
+      [yY]|[yY][eE][sS]|[zZ]|[zZ][eE][sS]) [ $DBG ] && echo "DBG: getOK(): return 0 (yes)" 1>&2;
       return 0;;
-      [nN]|[nN][oO]|[nN][oO][nN]) [ $DBG ] && echo "DBG: getOK(): return 0 (yes)";
+      [nN]|[nN][oO]|[nN][oO][nN]) [ $DBG ] && echo "DBG: getOK(): return 1 (no)" 1>&2;
       return 1;;
     esac
   done;
@@ -361,7 +361,7 @@ nicifyPackagelist() { local fn=nicifyPackagelist;
 
 _cleanup_() {
     [ $CLEANUP_DONE ] && return;
-    [ $DBG ] && echo && echo "CLEANUP! ($?) [$*]" 1>&2;
+    [ $DBG ] && { echo; echo "CLEANUP! ($?) [$*]"; } 1>&2;
     [ -n "$TEMPFILES" ] && rm -f $TEMPFILES;
     CLEANUP_DONE=1
     exit;
@@ -447,7 +447,7 @@ list_orphanedPackages() { local fn=list_orphanedPackages;
             LC_ALL=C sort -u "$_keep" -o "$_keep"
             LC_ALL=C sort -u "$_usr" | LC_ALL=C comm -23 - "$_keep"
             ;;
-        brew) [ $DBG ] && echo "   \"$c_brew\" bundle --file="$KEEPFILE" --verbose cleanup";
+        brew) [ $DBG ] && echo "   \"$c_brew\" bundle --file="$KEEPFILE" --verbose cleanup" 1>&2;
               "$c_brew" bundle --file="$KEEPFILE" --verbose cleanup ;;
         arch)  $c_ARCH -Qtdq ;; # pacaur -Qtdi; ;;
                # Either pacman -Qdtq | sudo pacman -Rns -   # <<< removes all unneeded packages, but leaves optional dependencies intact
@@ -463,7 +463,7 @@ remove_orphanedPackages() { local fn=remove_orphanedPackages;
     if [ "$DISTRO" != "brew" ]; then tmp="$( $0 -o )"; [ -z "$tmp" ] && return; fi # nothing to do
     case $DISTRO in
         fedora) yum remove $tmp; ;;
-        brew) [ $DBG ] && echo "   \"$c_brew\" bundle --file="$KEEPFILE" --verbose --force cleanup";
+        brew) [ $DBG ] && echo "   \"$c_brew\" bundle --file="$KEEPFILE" --verbose --force cleanup" 1>&2;
               "$c_brew" bundle --file="$KEEPFILE" --verbose --force cleanup ;;
         arch) $c_ARCH -R --nosave --recursive --unneeded $tmp; ;;  # == $c_ARCH -Rcsu
             #tmp=$( $c_ARCH -Q --deps --unrequired| xargs echo );
@@ -500,13 +500,8 @@ remove_distro_orphanedPackages() { local fn=remove_distro_orphanedPackages;
 list_missingPackages() { local fn=list_missingPackages;
     case $DISTRO in
         brew)
-            if [ $DBG ]; then
-              echo "DBG: list_missingPackages(): NORMALLY: \"$c_brew\" bundle --file=\"$KEEPFILE\" check --verbose|grep -v \"^The Brewfile's dependencies are satisfied\""
-              echo "DBG: list_missingPackages(): But running now simply: \"$c_brew\" bundle --file=\"$KEEPFILE\" check --verbose"
-              "$c_brew" bundle --file="$KEEPFILE" check --verbose
-            else
-              "$c_brew" bundle --file="$KEEPFILE" check --verbose|grep -v "^The Brewfile's dependencies are satisfied.\|\"$c_brew\" bundle can't satisfy your .* dependencies.\|Satisfy missing dependencies with .*"|sed -e 's/→ Formula \(.*\) needs to be installed or updated./brew "\1"/'|sed -e 's/→ Cask \(.*\) needs to be installed or updated./cask "\1"/'|sed -e 's/→ Tap \(.*\) needs to be tapped./tap "\1"/'
-            fi
+            [ $DBG ] && echo "DBG: list_missingPackages(): \"$c_brew\" bundle --file=\"$KEEPFILE\" check --verbose -- its answer, unfiltered, on stderr" 1>&2
+            "$c_brew" bundle --file="$KEEPFILE" check --verbose|{ if [ $DBG ]; then tee /dev/stderr; else cat; fi; }|grep -v "^The Brewfile's dependencies are satisfied.\|\"$c_brew\" bundle can't satisfy your .* dependencies.\|Satisfy missing dependencies with .*"|sed -e 's/→ Formula \(.*\) needs to be installed or updated./brew "\1"/'|sed -e 's/→ Cask \(.*\) needs to be installed or updated./cask "\1"/'|sed -e 's/→ Tap \(.*\) needs to be tapped./tap "\1"/'
             ;;
         fedora) $0 -l|xargs yum install|grep -v 'already installed and latest version'; ;;
         arch) 
@@ -539,7 +534,7 @@ list_missingPackages() { local fn=list_missingPackages;
     esac
 }
 install_missingPackages() { local fn=install_missingPackages;
-    [ $DBG ] && echo "DBG: install_missingPackages()"
+    [ $DBG ] && echo "DBG: install_missingPackages()" 1>&2
     case "$DISTRO" in
     "brew")
       tmp="$( $0 -m 2>&1)"; [ -n "$tmp" ] && echo " + Missing:$(echo; echo "$tmp"|sed -e 's/^/     /')";
@@ -558,9 +553,9 @@ install_missingPackages() { local fn=install_missingPackages;
             local taps="$(echo "$tmp"|sed -n 's/^.* [tT][aA][pP] \(.*\) needs to be tapped.*$/\1/p')";
             local formulae="$(echo "$tmp"|sed -n -e 's/^.* [bB][rR][eE][wW] \(.*\) needs to be installed.*$/\1/p' -e 's/^.* Formula \(.*\) needs to be installed.*$/\1/p')";
             local casks="$(echo "$tmp"|sed -n 's/^.* [cC][aA][sS][kK] \(.*\) needs to be installed.*$/\1/p')";
-            [ $DBG ] && echo "DBG: [yes, install/update] --> taps: echo '$taps'|xargs -n 1 \"$c_brew\" tap";
-            [ $DBG ] && echo "DBG: [yes, install/update] --> formulae: echo '$formulae'|xargs -n 10 \"$c_brew\" install";
-            [ $DBG ] && echo "DBG: [yes, install/update] --> casks: echo '$casks'|xargs -n 10 \"$c_brew\" install --cask";
+            [ $DBG ] && echo "DBG: [yes, install/update] --> taps: echo '$taps'|xargs -n 1 \"$c_brew\" tap" 1>&2;
+            [ $DBG ] && echo "DBG: [yes, install/update] --> formulae: echo '$formulae'|xargs -n 10 \"$c_brew\" install" 1>&2;
+            [ $DBG ] && echo "DBG: [yes, install/update] --> casks: echo '$casks'|xargs -n 10 \"$c_brew\" install --cask" 1>&2;
             getOK "\n   Do you want to install/update all the missing stuff? " || return 0;
             echo "..."
             [ -n "$taps" ]     && echo " > NEW TAPS:";         for a in $(echo "$taps"|xargs echo); do echo " >>   tap '$a'"; "$c_brew" tap "$a" || err 018 "FAILED [$?] \"$c_brew\" tap \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL TAPS: for a in $(echo $taps|xargs echo); do \"$c_brew\" tap \"\$a\""; done;
@@ -870,6 +865,12 @@ rt_err_stderr() {
   _rt_check "every err call carries its own code" \
     "$(grep -o 'err [0-9][0-9][0-9] ' "$B" | sort | uniq -d | tr '\n' ' ')/$(grep -c '[^_]er[r] "' "$B")" "/0"
 }
+rt_debug_stdout() {
+  for _rt_c in -R -o -m -L; do
+    _rt_check "-D $_rt_c: stdout is the same as without -D (the debug lines go to stderr)" \
+      "$("$T/wf.brew" -D "$_rt_c" 2>/dev/null; echo .)" "$("$T/wf.brew" "$_rt_c" 2>/dev/null; echo .)"   # the dot: a trailing blank line counts
+  done
+}
 rt_plain_sh() {
   _rt_check "runs the same under plain sh as under its dash" \
     "$(WORLDFILE_CONFIG=$T/conf.brew sh "$T/wf" -R)" "$("$T/wf.brew" -R)"
@@ -883,7 +884,7 @@ rt_guard() {
 
 run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
   # the run list: each name NAME is the test function rt_NAME, run in this order
-  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails detect_macos detect_fedora detect_like detect_unknown config_wins create_config err_stderr world_per_os select select_tier_only_when_needed select_errors setup_list setup_run plain_sh guard"
+  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails detect_macos detect_fedora detect_like detect_unknown config_wins create_config err_stderr debug_stdout world_per_os select select_tier_only_when_needed select_errors setup_list setup_run plain_sh guard"
   _rt_tot=0; _rt_n=0; _rt_sel=
   for _rt_a in $_rt_all; do
     _rt_tot=$((_rt_tot+1))
