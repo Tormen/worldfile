@@ -375,7 +375,7 @@ _cleanup_() {
 # uses flag_filterByLeadingSpaces
 list_worldfile() { # == includes
     case $DISTRO in
-        brew) APPENDIX="$(cat "$WORLDFILE"|sed -n 's/^[[:space:]]*##*[[:space:]]*\(manual[[:space:]][[:space:]]*[^[:space:]][^[:space:]]*\).*/\1/p'|sort)";;
+        brew) APPENDIX="$(sed -n 's/^[[:space:]]*##*[[:space:]]*\(manual[[:space:]][^#]*[^#[:space:]]\).*/\1/p' "$WORLDFILE"|sort)";;   # the whole name, up to a comment
         *) APPENDIX="";;
     esac
 
@@ -745,8 +745,8 @@ rt_brew_R() {
     "$("$T/wf.brew" -R)" "$(printf '%s\n' 'tap "a/b"' 'brew "git"' 'brew "grep"' 'cask "iterm2"')"
 }
 rt_brew_l() {
-  _rt_check "brew -l: the keep list, then the '# manual' entries (each cut at its first blank)" \
-    "$("$T/wf.brew" -l)" "$(printf '%s\n' 'tap "a/b"' 'brew "git"' 'brew "grep"' 'cask "iterm2"' 'manual "Some')"   # cut at the first blank: what it does today
+  _rt_check "brew -l: the keep list, then the '# manual' entries -- the whole name, its comment cut off" \
+    "$("$T/wf.brew" -l)" "$(printf '%s\n' 'tap "a/b"' 'brew "git"' 'brew "grep"' 'cask "iterm2"' 'manual "Other Tool"' 'manual "Some App"')"
 }
 rt_brew_L() {
   _rt_check "brew -L: the commented-out entries, '# manual' ones excluded" \
@@ -900,7 +900,7 @@ run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
   # shellcheck disable=SC2016  # the stub's $* must expand when IT runs
   printf '#!/bin/sh\ncase "$1" in list) grep -qx "$3" "%s/installed"; exit ;; tap) cat "%s/installed"; exit ;; esac\necho "$*" >> "%s/brew.log"\nfor a; do case "$a" in --file=*) cat "${a#--file=}" > "%s/keep.seen" ;; esac; done\nprintf "Would uninstall formulae:\\nstray\\n"\n' "$T" "$T" "$T" "$T" > "$T/bin/brew"
   chmod 700 "$T/bin/brew"
-  printf '%s\n' '#### SECTION' 'brew "grep"   # why' 'tap "a/b"' '  brew "git"' '# brew "old"' 'cask "iterm2"' '' '# manual "Some App"' > "$T/world"
+  printf '%s\n' '#### SECTION' 'brew "grep"   # why' 'tap "a/b"' '  brew "git"' '# brew "old"' 'cask "iterm2"' '' '# manual "Some App"' '#manual "Other Tool"   # by hand' > "$T/world"
   echo Darwin > "$T/uname"; echo my-box > "$T/hostname"; _rt_copy
   # the selector world: this machine is my-box, tier MINE (the stub logs each call)
   printf '#!/bin/sh\necho called >> "%s/tier.log"\necho MINE\n' "$T" > "$T/bin/tier"; chmod 700 "$T/bin/tier"
