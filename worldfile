@@ -27,6 +27,11 @@ TIER_COMMAND=
 # the tiers a %TIER may name; empty = any word (a misspelt tier then matches no machine, silently)
 TIERS=
 
+# the command that names the machines a selector selects, one per line, the selector its last
+# argument (my-rollout: `my-rollout hosts match`) -- asked once per selector, and then TIER_COMMAND
+# and TIERS are not used; empty = worldfile reads %TIER and @host itself
+SELECT_COMMAND=
+
 # the keep list: the world file stripped to package names, rebuilt by every command that needs it
 # (brew keeps its Brewfile.lock.json beside it); empty = /var/cache/worldfile/<DISTRO>.keeplist,
 # fedora: a temp file of the run
@@ -245,7 +250,8 @@ world_select() { # world_select MODE FILE -- FILE as this machine sees it (WF_TI
                  #   lines   its lines for this machine, selector and set-up cut off;
                  #   setups  "ENTRY<tab>COMMAND" for each wanted entry of this machine, each COMMAND once;
                  #   tier    "tier" when a selector names a %TIER, nothing otherwise
-    awk -v mode="$1" -v tier="$WF_TIER" -v host="$WF_HOST" -v tiers="$TIERS" '
+    awk -v mode="$1" -v tier="$WF_TIER" -v host="$WF_HOST" -v tiers="$TIERS" -v picked="${WF_PICKED:-}" '
+    BEGIN { if (picked != "") while ((getline l < picked) > 0) yes[l] }
     function fail(m) { printf "%s line %d: %s\n", FILENAME, FNR, m > "/dev/stderr"; exit 2 }
     function one(t,   n) {
         n = substr(t, 2)
@@ -283,7 +289,8 @@ world_select() { # world_select MODE FILE -- FILE as this machine sees it (WF_TI
             }
         }
         if (mode == "tier") { if (sel ~ /%/) { print "tier"; exit } next }
-        if (sel != "" && !selects(sel)) next
+        if (mode == "sels") { if (sel != "") print sel; next }
+        if (sel != "" && !(picked != "" ? (sel in yes) : selects(sel))) next
         if (mode == "lines") { print line; next }
         if (setup == "" || (setup in seen)) next
         entry = line
@@ -297,26 +304,37 @@ world_select() { # world_select MODE FILE -- FILE as this machine sees it (WF_TI
 world_here() { # WORLDFILE becomes this machine's lines of it (a temp file); WORLDFILE_SRC keeps the file itself
     WORLDFILE_SRC=$WORLDFILE
     [ -r "$WORLDFILE_SRC" ] || return 0      # the command that reads it says so, as before
-    WF_HOST="$(hostname -s)"; WF_TIER=
-    if [ -n "$(world_select tier "$WORLDFILE_SRC")" ]; then
-        [ -n "$TIER_COMMAND" ] || err 008 "'$WORLDFILE_SRC' names a %TIER, and TIER_COMMAND is empty: set it in the config to the command that prints this machine's tier"
+    WF_HOST="$(hostname -s)"; WF_TIER=; WF_PICKED=
+    if [ -n "$SELECT_COMMAND" ]; then
+        # the selectors this machine is in, as SELECT_COMMAND reads them -- its one reading, not ours
+        WF_PICKED=$(new_tempfile); TEMPFILES="$TEMPFILES $WF_PICKED"
+        echo "-" > "$WF_PICKED"            # never empty: an empty file would read as "worldfile reads them"
+        while IFS= read -r _sel; do
+            # shellcheck disable=SC2086  # SELECT_COMMAND is a command line
+            _hosts=$($SELECT_COMMAND "$_sel") || err 008 "FAILED [$?] SELECT_COMMAND '$SELECT_COMMAND' '$_sel'"
+            printf '%s\n' "$_hosts" | grep -qx "$WF_HOST" && printf '%s\n' "$_sel" >> "$WF_PICKED"
+        done <<_EOF
+$(world_select sels "$WORLDFILE_SRC" | sort -u)
+_EOF
+    elif [ -n "$(world_select tier "$WORLDFILE_SRC")" ]; then
+        [ -n "$TIER_COMMAND" ] || err 009 "'$WORLDFILE_SRC' names a %TIER, and TIER_COMMAND is empty: set it in the config to the command that prints this machine's tier"
         # shellcheck disable=SC2086  # TIER_COMMAND is a command line
-        WF_TIER=$($TIER_COMMAND) || err 009 "FAILED [$?] TIER_COMMAND '$TIER_COMMAND'"
-        [ -n "$WF_TIER" ] || err 010 "TIER_COMMAND '$TIER_COMMAND' printed no tier"
+        WF_TIER=$($TIER_COMMAND) || err 010 "FAILED [$?] TIER_COMMAND '$TIER_COMMAND'"
+        [ -n "$WF_TIER" ] || err 011 "TIER_COMMAND '$TIER_COMMAND' printed no tier"
     fi
     WORLDFILE=$(new_tempfile); TEMPFILES="$TEMPFILES $WORLDFILE"
-    world_select lines "$WORLDFILE_SRC" > "$WORLDFILE" || err 011 "cannot read -r the selectors of '$WORLDFILE_SRC' (above)"
+    world_select lines "$WORLDFILE_SRC" > "$WORLDFILE" || err 012 "cannot read -r the selectors of '$WORLDFILE_SRC' (above)"
 }
 
 create_config() { # create_config [FILE] -- the default config to stdout, or into FILE when it does not exist yet
     [ -z "$1" ] && { default_config_content; return; }
-    [ -e "$1" ] && err 012 "--create-config: '$1' exists already -- not overwritten"
-    default_config_content > "$1" || err 013 "--create-config: cannot write '$1'"
+    [ -e "$1" ] && err 013 "--create-config: '$1' exists already -- not overwritten"
+    default_config_content > "$1" || err 014 "--create-config: cannot write '$1'"
     echo " >>> default config written to $1"
 }
 
 new_tempfile() { # a new, empty temp file -- one per call
-    mktemp "${TMPDIR:-/tmp}/worldfile.XXXXXX" || err 014 "mktemp failed"
+    mktemp "${TMPDIR:-/tmp}/worldfile.XXXXXX" || err 015 "mktemp failed"
 }
 
 # shellcheck disable=SC2086,SC2046,SC2154  # $tmp, $opt and $c_ARCH are lists (package names; a command line); c_ARCH is set by the config
@@ -429,7 +447,7 @@ list_dnf() { # list_dnf FILE ARGS... -- "$c_DNF" ARGS into FILE; its stderr is s
     _ld_f=$1; shift
     # shellcheck disable=SC2154  # c_DNF is set by the config
     "$c_DNF" "$@" > "$_ld_f" 2> "$_ld_f.err" && return 0
-    _ld_rc=$?; cat "$_ld_f.err" 1>&2; err 015 "FAILED [$_ld_rc] $c_DNF $*"
+    _ld_rc=$?; cat "$_ld_f.err" 1>&2; err 016 "FAILED [$_ld_rc] $c_DNF $*"
 }
 
 fedora_missing() { # the world file's packages (its keep list) that dnf has not installed, one name per line
@@ -537,7 +555,7 @@ list_missingPackages() { local fn=list_missingPackages;
             [ -z "$tmp" ] && return;
             tmp2="$(echo "$tmp"|sed -n "s/^error: package '\([^']\+\)' was not found$/\1/p")"
             [ -n "$DBG" ] && echo "DBG: --> tmp2='$tmp2' (tmp stripped to package names)" 1>&2
-            [ "$(echo "$tmp"|wc -l)" != "$(echo "$tmp2"|wc -l)" ] && err 016 "list_missingPackages: INTERNAL ERROR. There seems to be a format problem in the output of pacaur -Q. (See tmp='$tmp', tmp2='$tmp2'.)"
+            [ "$(echo "$tmp"|wc -l)" != "$(echo "$tmp2"|wc -l)" ] && err 017 "list_missingPackages: INTERNAL ERROR. There seems to be a format problem in the output of pacaur -Q. (See tmp='$tmp', tmp2='$tmp2'.)"
 
             ### Filter out groups:
             [ -n "$DBG" ] && echo "DBG: $c_ARCH -Q --groups $(echo "$tmp2"|xargs echo) 2>&1 >/dev/null" 1>&2
@@ -546,7 +564,7 @@ list_missingPackages() { local fn=list_missingPackages;
             [ -z "$tmp" ] && return;
             tmp2="$(echo "$tmp"|sed -n "s/^error: group '\([^']\+\)' was not found$/\1/p")"
             [ -n "$DBG" ] && echo "DBG: --> tmp2='$tmp2' (tmp stripped to package names)" 1>&2
-            [ "$(echo "$tmp"|wc -l)" != "$(echo "$tmp2"|wc -l)" ] && err 017 "list_missingPackages: INTERNAL ERROR. There seems to be a format problem in the output of pacaur -Q --groups. (See tmp='$tmp', tmp2='$tmp2'.)"
+            [ "$(echo "$tmp"|wc -l)" != "$(echo "$tmp2"|wc -l)" ] && err 018 "list_missingPackages: INTERNAL ERROR. There seems to be a format problem in the output of pacaur -Q --groups. (See tmp='$tmp', tmp2='$tmp2'.)"
 
             echo "$tmp2"|sort
             ;; 
@@ -583,9 +601,9 @@ install_missingPackages() { local fn=install_missingPackages;
             [ -n "$DBG" ] && echo "DBG: [yes, install/update] --> casks: echo '$casks'|xargs -n 10 \"$c_brew\" install --cask" 1>&2;
             getOK "\n   Do you want to install/update all the missing stuff? " || return 0;
             echo "..."
-            [ -n "$taps" ]     && echo " > NEW TAPS:";         for a in $(echo "$taps"|xargs echo); do echo " >>   tap '$a'"; "$c_brew" tap "$a" || err 018 "FAILED [$?] \"$c_brew\" tap \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL TAPS: for a in $(echo "$taps"|xargs echo); do \"$c_brew\" tap \"\$a\""; done;
-            [ -n "$formulae" ] && echo " > NEW FORMULAE:";     for a in $(echo "$formulae"|xargs echo); do echo " >>   '$a'"; "$c_brew" install "$a" || err 019 "FAILED [$?] \"$c_brew\" install \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL FORMULAE: for a in $(echo "$formulae"|xargs echo); do \"$c_brew\" install \"\$a\""; done
-            [ -n "$casks" ]    && echo " > NEW CASKS:";        for a in $(echo "$casks"|xargs echo); do echo " >>   cask '$a'"; "$c_brew" install --cask "$a" || err 020 "FAILED [$?] \"$c_brew install --cask \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL casks: for a in $(echo "$casks"|xargs echo); do \"$c_brew\" install --cask \"\$a\"; done${NL}${NL}REMARK: In case of FAILING cask installs because the dir /Application already exists, you can use this to remove them (probably) all:${NL}"'echo "$casks"|while read -r a; do a2="$(echo "$a"|sed -e "s/[-]//g")"; a3="$(echo "$a"|tr "-" " ")"; for c in "$a" "$a2" "$a3"; do b="$(ls -1 /Applications|grep -i "$c")"; [ -n "$DBG" ] && echo "DBG: c=\"$c\" -> b=\"$b\""; [ -n "$b" ] && echo "$b"; done; done|sort|uniq|while read -r a; do echo "$a..."; rm "/Applications/$a"; done'; done
+            [ -n "$taps" ]     && echo " > NEW TAPS:";         for a in $(echo "$taps"|xargs echo); do echo " >>   tap '$a'"; "$c_brew" tap "$a" || err 019 "FAILED [$?] \"$c_brew\" tap \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL TAPS: for a in $(echo "$taps"|xargs echo); do \"$c_brew\" tap \"\$a\""; done;
+            [ -n "$formulae" ] && echo " > NEW FORMULAE:";     for a in $(echo "$formulae"|xargs echo); do echo " >>   '$a'"; "$c_brew" install "$a" || err 020 "FAILED [$?] \"$c_brew\" install \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL FORMULAE: for a in $(echo "$formulae"|xargs echo); do \"$c_brew\" install \"\$a\""; done
+            [ -n "$casks" ]    && echo " > NEW CASKS:";        for a in $(echo "$casks"|xargs echo); do echo " >>   cask '$a'"; "$c_brew" install --cask "$a" || err 021 "FAILED [$?] \"$c_brew install --cask \"$a\"${NL}${NL}WITHIN LOOP TO INSTALL ALL casks: for a in $(echo "$casks"|xargs echo); do \"$c_brew\" install --cask \"\$a\"; done${NL}${NL}REMARK: In case of FAILING cask installs because the dir /Application already exists, you can use this to remove them (probably) all:${NL}"'echo "$casks"|while read -r a; do a2="$(echo "$a"|sed -e "s/[-]//g")"; a3="$(echo "$a"|tr "-" " ")"; for c in "$a" "$a2" "$a3"; do b="$(ls -1 /Applications|grep -i "$c")"; [ -n "$DBG" ] && echo "DBG: c=\"$c\" -> b=\"$b\""; [ -n "$b" ] && echo "$b"; done; done|sort|uniq|while read -r a; do echo "$a..."; rm "/Applications/$a"; done'; done
             #brew bundle --file="$KEEPFILE" install|grep -v "^Using ";
             ;;
         arch)  [ -n "$DBG" ] && echo "$c_ARCH -S $tmp" 1>&2
@@ -654,7 +672,7 @@ is_installed() { local fn=is_installed; # is_installed ENTRY -- exit 0 when the 
 }
 
 list_setups() { # this machine's set-ups: "ENTRY<tab>COMMAND", in world-file order, each command once
-    [ -r "$WORLDFILE_SRC" ] || err 021 "cannot read -r the world file '$WORLDFILE_SRC'"
+    [ -r "$WORLDFILE_SRC" ] || err 022 "cannot read -r the world file '$WORLDFILE_SRC'"
     world_select setups "$WORLDFILE_SRC"
 }
 run_setups() { # each set-up of this machine whose package is installed; 1 when one failed -- a set-up
@@ -710,7 +728,7 @@ diff_between_worlfile_and_packageManager() { local fn=diff_between_worldfile_and
     case $DISTRO in
         fedora) XXXX fedora; ;;
         arch)
-            cd /tmp || err 022 "cannot cd to /tmp"
+            cd /tmp || err 023 "cannot cd to /tmp"
             tmpWorldfileList=worldfile-packagelist;
             tmpPackageManagerList=pacman_-Qe___explicitly-installed-packages;
             cp "$KEEPFILE" "/tmp/$tmpWorldfileList"
@@ -859,6 +877,18 @@ rt_select_tier_only_when_needed() {
   WORLDFILE_CONFIG=$T/conf.sel "$T/wf" -R > /dev/null
   _rt_check "a %TIER in it: TIER_COMMAND is run once" "$(grep -c . "$T/tier.log")" 1
 }
+rt_select_command() {
+  # SELECT_COMMAND names the machines of a selector; this machine is my-box. The stub logs each call
+  # shellcheck disable=SC2016  # expands when the stub runs
+  printf '#!/bin/sh\necho "$1" >> "%s/sel.log"\ncase "$1" in @my-box|%%MINE|%%FOREIGN+@my-box|%%MINE+@my-box) echo my-box ;; esac\necho other\n' "$T" > "$T/bin/sel"
+  chmod 700 "$T/bin/sel"; : > "$T/sel.log"; : > "$T/tier.log"
+  { grep -v '^TIER' "$T/conf.sel"; printf 'SELECT_COMMAND="%s/bin/sel"\n' "$T"; } > "$T/conf.sel.cmd"
+  _rt_got=$(WORLDFILE_CONFIG=$T/conf.sel.cmd "$T/wf" -R)
+  _rt_check "...asked once per selector, and TIER_COMMAND never run" \
+    "$(sort "$T/sel.log" | uniq -d | grep -c .)/$(grep -c . "$T/sel.log")/$(grep -c . "$T/tier.log")" "0/7/0"
+  _rt_check "SELECT_COMMAND: the same lines as worldfile's own reading of the selectors" \
+    "$_rt_got" "$(WORLDFILE_CONFIG=$T/conf.sel "$T/wf" -R)"
+}
 rt_select_errors() {
   printf 'WORLDFILE="%s/world.sel"\n' "$T" > "$T/conf.sel.notier"
   _rt_out=$(WORLDFILE_CONFIG=$T/conf.sel.notier "$T/wf" -R 2>&1); _rt_rc=$?
@@ -937,16 +967,16 @@ rt_guard() {
 
 run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
   # the run list: each name NAME is the test function rt_NAME, run in this order
-  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails fedora_dnf detect_macos detect_fedora detect_like detect_unknown config_wins create_config err_stderr debug_stdout R_split world_per_os select select_tier_only_when_needed select_errors setup_list setup_run plain_sh guard"
+  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails fedora_dnf detect_macos detect_fedora detect_like detect_unknown config_wins create_config err_stderr debug_stdout R_split world_per_os select select_tier_only_when_needed select_errors select_command setup_list setup_run plain_sh guard"
   _rt_tot=0; _rt_n=0; _rt_sel=
   for _rt_a in $_rt_all; do
     _rt_tot=$((_rt_tot+1))
     case "$_rt_a" in *"$1"*) _rt_n=$((_rt_n+1)); _rt_sel="$_rt_sel $_rt_a" ;; esac
   done
-  [ "$_rt_n" -gt 0 ] || err 023 "--run-tests: no test name contains '$1' (tests: $_rt_all)"
+  [ "$_rt_n" -gt 0 ] || err 024 "--run-tests: no test name contains '$1' (tests: $_rt_all)"
 
-  B=$(_rt_self) || err 024 "--run-tests: cannot resolve the real path of '$0'"
-  T=$(mktemp -d /tmp/worldfile-tests.XXXXXX) || err 025 "--run-tests: mktemp -d failed"
+  B=$(_rt_self) || err 025 "--run-tests: cannot resolve the real path of '$0'"
+  T=$(mktemp -d /tmp/worldfile-tests.XXXXXX) || err 026 "--run-tests: mktemp -d failed"
   trap 'rm -rf "$T"' 0
   mkdir "$T/bin"
   # shellcheck disable=SC2016  # the stub's $* must expand when IT runs
@@ -1026,7 +1056,7 @@ for a in "$@"; do
     case "$a" in --config=*) _cfg=${a#--config=} ;; esac
     _prev=$a
 done
-[ "$_prev" = --config ] && err 026 "--config needs a FILE"
+[ "$_prev" = --config ] && err 027 "--config needs a FILE"
 load_config "$_cfg"
 
 # KEEPFILE: ( == stripped worldfile with only packagenames)
@@ -1037,9 +1067,9 @@ esac; fi
 
 # check for valid DISTRO:
 case $DISTRO in
-    #brew) [ $EUID -eq 0 ] && err 027 "Please do NOT run as root on MacOS (brew)!";;
+    #brew) [ $EUID -eq 0 ] && err 028 "Please do NOT run as root on MacOS (brew)!";;
     fedora|arch|brew|debian|opensuse) ;;
-    *) err 028 "Unsupported DISTRO '$DISTRO'"; ;;
+    *) err 029 "Unsupported DISTRO '$DISTRO'"; ;;
 esac
 
 [ $# -eq 0 ] && usage;
@@ -1072,60 +1102,60 @@ while [ $# -gt 0 ]; do
         --config) shift; ;; # read -r before the loop
         --config=*) ;;
 
-        -ll) [ -n "$cmd" ] && err 029 "Only one COMMAND possible"; cmd="list_worldfile"; flag_nicifyPackagelist=1; ;;
-        -l)  [ -n "$cmd" ] && err 030 "Only one COMMAND possible"; cmd="list_worldfile"; ;;
+        -ll) [ -n "$cmd" ] && err 030 "Only one COMMAND possible"; cmd="list_worldfile"; flag_nicifyPackagelist=1; ;;
+        -l)  [ -n "$cmd" ] && err 031 "Only one COMMAND possible"; cmd="list_worldfile"; ;;
         -l[0-9]|-l[0-9]-[1-9])  
-             [ -n "$cmd" ] && err 031 "Only one COMMAND possible"; cmd="list_worldfile";
+             [ -n "$cmd" ] && err 032 "Only one COMMAND possible"; cmd="list_worldfile";
                                                                flag_filterByLeadingSpaces=$(echo "$arg"|sed -e 's/^-l//'|tr - ,); ;;
-        -LL) err 032 "Not supported. Use -ll instead."; ;;
-        -L)  [ -n "$cmd" ] && err 033 "Only one COMMAND possible"; cmd="list_worldfile_comments"; ;;
+        -LL) err 033 "Not supported. Use -ll instead."; ;;
+        -L)  [ -n "$cmd" ] && err 034 "Only one COMMAND possible"; cmd="list_worldfile_comments"; ;;
 
-        -ii) err 034 "No nicify possible for /invalid/ packages ;)"; ;;
-        -i)  [ -n "$cmd" ] && err 035 "Only one COMMAND possible"; cmd="list_invalid_worldfile_entries"; ;;
-        -II) [ -n "$cmd" ] && err 036 "Only one COMMAND possible"; cmd="list_valid_worldfile_entries"; flag_nicifyPackagelist=1; ;;
-        -I)  [ -n "$cmd" ] && err 037 "Only one COMMAND possible"; cmd="list_valid_worldfile_entries"; ;;
+        -ii) err 035 "No nicify possible for /invalid/ packages ;)"; ;;
+        -i)  [ -n "$cmd" ] && err 036 "Only one COMMAND possible"; cmd="list_invalid_worldfile_entries"; ;;
+        -II) [ -n "$cmd" ] && err 037 "Only one COMMAND possible"; cmd="list_valid_worldfile_entries"; flag_nicifyPackagelist=1; ;;
+        -I)  [ -n "$cmd" ] && err 038 "Only one COMMAND possible"; cmd="list_valid_worldfile_entries"; ;;
 
-        -mm) [ -n "$cmd" ] && err 038 "Only one COMMAND possible"; cmd="list_missingPackages"; flag_nicifyPackagelist=1; ;;
-        -m)  [ -n "$cmd" ] && err 039 "Only one COMMAND possible"; cmd="list_missingPackages"; ;;
-        -M)  [ -n "$cmd" ] && err 040 "Only one COMMAND possible"; cmd="install_missingPackages"; ;;
+        -mm) [ -n "$cmd" ] && err 039 "Only one COMMAND possible"; cmd="list_missingPackages"; flag_nicifyPackagelist=1; ;;
+        -m)  [ -n "$cmd" ] && err 040 "Only one COMMAND possible"; cmd="list_missingPackages"; ;;
+        -M)  [ -n "$cmd" ] && err 041 "Only one COMMAND possible"; cmd="install_missingPackages"; ;;
 
-        -cc) [ -n "$cmd" ] && err 041 "Only one COMMAND possible"; cmd="list_commentedPackages_to_be_removed"; flag_nicifyPackagelist=1; ;;
-        -c)  [ -n "$cmd" ] && err 042 "Only one COMMAND possible"; cmd="list_commentedPackages_to_be_removed"; ;;
-        -C)  [ -n "$cmd" ] && err 043 "Only one COMMAND possible"; cmd="remove_commentedPackages"; ;;
+        -cc) [ -n "$cmd" ] && err 042 "Only one COMMAND possible"; cmd="list_commentedPackages_to_be_removed"; flag_nicifyPackagelist=1; ;;
+        -c)  [ -n "$cmd" ] && err 043 "Only one COMMAND possible"; cmd="list_commentedPackages_to_be_removed"; ;;
+        -C)  [ -n "$cmd" ] && err 044 "Only one COMMAND possible"; cmd="remove_commentedPackages"; ;;
 
-        -oo) [ -n "$cmd" ] && err 044 "Only one COMMAND possible"; cmd="list_orphanedPackages"; flag_nicifyPackagelist=1; ;;
-        -o)  [ -n "$cmd" ] && err 045 "Only one COMMAND possible"; cmd="list_orphanedPackages"; ;;
-        -O)  [ -n "$cmd" ] && err 046 "Only one COMMAND possible"; cmd="remove_orphanedPackages"; ;;
+        -oo) [ -n "$cmd" ] && err 045 "Only one COMMAND possible"; cmd="list_orphanedPackages"; flag_nicifyPackagelist=1; ;;
+        -o)  [ -n "$cmd" ] && err 046 "Only one COMMAND possible"; cmd="list_orphanedPackages"; ;;
+        -O)  [ -n "$cmd" ] && err 047 "Only one COMMAND possible"; cmd="remove_orphanedPackages"; ;;
 
-        -s) [ -n "$cmd" ] && err 047 "Only one COMMAND possible"; cmd="list_sections"; ;;
+        -s) [ -n "$cmd" ] && err 048 "Only one COMMAND possible"; cmd="list_sections"; ;;
 
-        -u) [ -n "$cmd" ] && err 048 "Only one COMMAND possible"; cmd="list_setups"; ;;
-        -U) [ -n "$cmd" ] && err 049 "Only one COMMAND possible"; cmd="run_setups"; ;;
+        -u) [ -n "$cmd" ] && err 049 "Only one COMMAND possible"; cmd="list_setups"; ;;
+        -U) [ -n "$cmd" ] && err 050 "Only one COMMAND possible"; cmd="run_setups"; ;;
 
         # FOR DEBUGGING PURPOSES:
         -d)  diff_between_worlfile_and_packageManager vimdiff; ;;
         #-D) diff_between_worlfile_and_packageManager "comm -123"; ;;
 
         -r)  flag_rebuildKeepfile=1; ;; # force rebuilding the keepfile
-        -R)  [ -n "$cmd" ] && err 050 "Only one COMMAND possible"; cmd="rebuild_keepfile_to_stdout"; ;;
+        -R)  [ -n "$cmd" ] && err 051 "Only one COMMAND possible"; cmd="rebuild_keepfile_to_stdout"; ;;
 
-        -doo)[ -n "$cmd" ] && err 051 "Only one COMMAND possible"; cmd="list_distro_orphanedPackages"; flag_nicifyPackagelist=1; ;;
-        -do) [ -n "$cmd" ] && err 052 "Only one COMMAND possible"; cmd="list_distro_orphanedPackages"; ;;
-        -dO) [ -n "$cmd" ] && err 053 "Only one COMMAND possible"; cmd="remove_distro_orphanedPackages"; ;;
+        -doo)[ -n "$cmd" ] && err 052 "Only one COMMAND possible"; cmd="list_distro_orphanedPackages"; flag_nicifyPackagelist=1; ;;
+        -do) [ -n "$cmd" ] && err 053 "Only one COMMAND possible"; cmd="list_distro_orphanedPackages"; ;;
+        -dO) [ -n "$cmd" ] && err 054 "Only one COMMAND possible"; cmd="remove_distro_orphanedPackages"; ;;
 
         *) usage; ;;
     esac;
 done
 
 [ -n "$flag_PURGE" ] && case "$DISTRO" in 
-    fedora|arch) err 054 "--purge not yet implemented for this DISTRO ($DISTRO)!"
+    fedora|arch) err 055 "--purge not yet implemented for this DISTRO ($DISTRO)!"
 esac
 case "$DISTRO" in
   brew)
     # shellcheck disable=SC2154  # set by the config
     c_brew=$c_BREW
     [ -z "$c_brew" ] && for c_brew in /opt/homebrew/bin/brew /usr/local/bin/brew ""; do [ -x "$c_brew" ] && break; done
-    [ -x "$c_brew" ] || err 055 "no brew found (c_BREW='$c_BREW', /opt/homebrew/bin/brew, /usr/local/bin/brew)"
+    [ -x "$c_brew" ] || err 056 "no brew found (c_BREW='$c_BREW', /opt/homebrew/bin/brew, /usr/local/bin/brew)"
     ;;
 esac
 
@@ -1146,7 +1176,7 @@ fi;
 ###########################################################################################
 ### DO THINGS:
 
-[ -n "$flag_rebuildKeepfile" ] && { rebuild_keepfile || err 056 "Failed to rebuild keepfile (= temporary, stripped version of the worldfile)!"; }
+[ -n "$flag_rebuildKeepfile" ] && { rebuild_keepfile || err 057 "Failed to rebuild keepfile (= temporary, stripped version of the worldfile)!"; }
 
 if [ -n "$flag_nicifyPackagelist" ]; then
     #$cmd|nicifyPackagelist;

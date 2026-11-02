@@ -45,6 +45,11 @@ Every command reads only the lines whose selector names this machine. A `%TIER`
 with `TIER_COMMAND` empty, or one that `TIERS` does not list, is an error
 naming the line -- never a silent miss.
 
+Where another tool already owns the selector -- a host table that knows every
+machine -- `SELECT_COMMAND` hands the reading to it: the command prints the
+machines a selector names, one per line, and is asked once per selector in the
+world file; `TIER_COMMAND` and `TIERS` are then not used.
+
 ### The set-up
 
 `setup: <command>` runs with `worldfile -U`, once the entry's package is
