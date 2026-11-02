@@ -310,6 +310,7 @@ world_here() { # WORLDFILE becomes this machine's lines of it (a temp file); WOR
         WF_PICKED=$(new_tempfile); TEMPFILES="$TEMPFILES $WF_PICKED"
         echo "-" > "$WF_PICKED"            # never empty: an empty file would read as "worldfile reads them"
         while IFS= read -r _sel; do
+            [ -n "$_sel" ] || continue     # a file with no selector at all still gives the heredoc one empty line
             # shellcheck disable=SC2086  # SELECT_COMMAND is a command line
             _hosts=$($SELECT_COMMAND "$_sel") || err 008 "FAILED [$?] SELECT_COMMAND '$SELECT_COMMAND' '$_sel'"
             printf '%s\n' "$_hosts" | grep -qx "$WF_HOST" && printf '%s\n' "$_sel" >> "$WF_PICKED"
@@ -888,6 +889,13 @@ rt_select_command() {
     "$(sort "$T/sel.log" | uniq -d | grep -c .)/$(grep -c . "$T/sel.log")/$(grep -c . "$T/tier.log")" "0/7/0"
   _rt_check "SELECT_COMMAND: the same lines as worldfile's own reading of the selectors" \
     "$_rt_got" "$(WORLDFILE_CONFIG=$T/conf.sel "$T/wf" -R)"
+  # a world file with no selector at all: nothing to ask -- a real SELECT_COMMAND refuses an empty one
+  # shellcheck disable=SC2016  # expands when the stub runs
+  printf '#!/bin/sh\n[ -n "$1" ] || exit 2\necho my-box\n' > "$T/bin/selstrict"; chmod 700 "$T/bin/selstrict"
+  { cat "$T/conf.brew"; printf 'SELECT_COMMAND="%s/bin/selstrict"\n' "$T"; } > "$T/conf.brew.cmd"
+  _rt_out=$(WORLDFILE_CONFIG=$T/conf.brew.cmd "$T/wf" -R 2>&1); _rt_rc=$?
+  _rt_check "no selector in the world file: SELECT_COMMAND is not asked about an empty one" \
+    "$_rt_rc/$(echo "$_rt_out" | grep -c .)" "0/4"
 }
 rt_select_errors() {
   printf 'WORLDFILE="%s/world.sel"\n' "$T" > "$T/conf.sel.notier"
