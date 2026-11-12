@@ -81,9 +81,15 @@ empty is `/etc/package-list.<os>`; `TIER_COMMAND` (this machine's tier) and
     worldfile --create-config /etc/worldfile.conf  # ...written to a file (never over one)
 
 The config is plain shell. It is `$WORLDFILE_CONFIG`, else `--config <FILE>`,
-else the first that exists of `/LINKS/default/worldfile.conf` (or
-`/LINKS/default/worldfile`), `~/.worldfile.conf`, `/etc/worldfile.conf`,
+else the first that exists of `$CONFIG_SEARCH_DIR/worldfile.conf` (or
+`$CONFIG_SEARCH_DIR/worldfile`), `~/.worldfile.conf`, `/etc/worldfile.conf`,
 `/usr/local/etc/worldfile.conf`.
+
+`CONFIG_SEARCH_DIR` comes from the site file `/LINKS/default/site.conf`
+(plain `KEY="value"` lines, shared by every tool of the site), read before
+the config; without it there is no such directory. There but unreadable, it
+is an error. worldfile keeps no state and no logs, so it uses no other key
+of that file.
 
 ## Tests
 
