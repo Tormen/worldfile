@@ -88,6 +88,14 @@ A selector is %TIER (TIER_COMMAND says this machine's) or @host (hostname -s), t
 or -TERM (remove), read -r left to right; no selector = every machine. Every command reads only the
 lines whose selector names this machine. The set-up runs with -U, once the package is installed.
 
+An entry INDENTED below a package's line is a DEPENDENCY of that package, installed for it:
+    brew \"yt-dlp\"
+      brew \"ffmpeg\"
+(indented below a COMMENT line instead, it is a group under that heading). Every command reads a
+dependency as an entry like any other -- -m names it while it is missing, -o never calls it
+orphaned; only -l<x> looks at the indentation. So when a package goes, comment its dependencies
+out too, unless another package needs them.
+
 _______________________________________________________________________________________________________
 
 COMMANDS:
@@ -427,7 +435,7 @@ list_worldfile() { # == includes
       cat "$KEEPFILE"
       [ -n "$APPENDIX" ] && echo "$APPENDIX"
     else
-      echo "cat \"$WORLDFILE\"|grep -v '^[[:space:]]*#'|sed -n \"s/^[[:space:]]\\{$flag_filterByLeadingSpaces\\}\\([^[:space:]]\\)/\\1/p\"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*/ /g'|grep -v '^[[:space:]]*$'"
+      [ -n "$DBG" ] && echo "DBG: cat \"$WORLDFILE\"|grep -v '^[[:space:]]*#'|sed -n \"s/^[[:space:]]\\{$flag_filterByLeadingSpaces\\}\\([^[:space:]]\\)/\\1/p\"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*/ /g'|grep -v '^[[:space:]]*$'" 1>&2
       cat "$WORLDFILE"|grep -v '^[[:space:]]*#'|sed -n "s/^[[:space:]]\{$flag_filterByLeadingSpaces\}\([^[:space:]]\)/\1/p"|sed -e 's/[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*/ /g'|grep -v '^[[:space:]]*$'
       [ -n "$APPENDIX" ] && echo "$APPENDIX"
     fi
@@ -817,6 +825,14 @@ rt_brew_l() {
   _rt_check "brew -l: the keep list, then the '# manual' entries -- the whole name, its comment cut off" \
     "$("$T/wf.brew" -l)" "$(printf '%s\n' 'tap "a/b"' 'brew "git"' 'brew "grep"' 'cask "iterm2"' 'manual "Other Tool"' 'manual "Some App"')"
 }
+rt_brew_l_indent() {
+  printf '%s\n' 'brew "yt-dlp"   # a package' '  brew "ffmpeg"  # its dependency' 'cask "iterm2"' > "$T/world.dep"
+  printf 'DISTRO=brew\nWORLDFILE="%s/world.dep"\nKEEPFILE="%s/keep.dep"\nc_BREW="%s/bin/brew"\n' "$T" "$T" "$T" > "$T/conf.dep"
+  _rt_check "a dependency (indented) is in the keep list like any entry" \
+    "$(WORLDFILE_CONFIG=$T/conf.dep "$T/wf" -R)" "$(printf '%s\n' 'brew "ffmpeg"' 'brew "yt-dlp"' 'cask "iterm2"')"
+  _rt_check "-l2 prints the entries indented by 2, and nothing else" \
+    "$(WORLDFILE_CONFIG=$T/conf.dep "$T/wf" -l2)" 'brew "ffmpeg"'
+}
 rt_brew_L() {
   _rt_check "brew -L: the commented-out entries, '# manual' ones excluded" \
     "$("$T/wf.brew" -L | grep -c 'brew "old"')/$("$T/wf.brew" -L | grep -c manual)" "1/0"
@@ -1021,7 +1037,7 @@ rt_guard() {
 
 run_tests() { # run_tests [SUBSTRING] -- exit 0 = all passed
   # the run list: each name NAME is the test function rt_NAME, run in this order
-  _rt_all="brew_R brew_l brew_L brew_o fedora_o fedora_o_dnf_fails fedora_dnf detect_macos detect_fedora detect_like detect_unknown config_wins site_conf create_config err_stderr debug_stdout R_split world_per_os select select_tier_only_when_needed select_errors select_command setup_list setup_run plain_sh guard"
+  _rt_all="brew_R brew_l brew_l_indent brew_L brew_o fedora_o fedora_o_dnf_fails fedora_dnf detect_macos detect_fedora detect_like detect_unknown config_wins site_conf create_config err_stderr debug_stdout R_split world_per_os select select_tier_only_when_needed select_errors select_command setup_list setup_run plain_sh guard"
   _rt_tot=0; _rt_n=0; _rt_sel=
   for _rt_a in $_rt_all; do
     _rt_tot=$((_rt_tot+1))

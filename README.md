@@ -27,6 +27,18 @@ NOT be there (`worldfile -c` lists those still installed). `# manual <name>`
 records something installed by hand, outside the package manager: it counts
 as listed.
 
+An entry indented below a package's line is a *dependency* of that package,
+installed for it (indented below a comment line instead, it is a group under
+that heading):
+
+    brew "yt-dlp"
+      brew "ffmpeg"
+
+worldfile reads a dependency as an entry like any other -- `-m` names it while
+it is missing, `-o` never calls it orphaned -- and only `-l<x>` (the entries
+indented by `<x>` blanks) looks at the indentation. So when a package goes,
+comment its dependencies out too, unless another package needs them.
+
 There is one world file per distribution: `package-list.<os>`, where `<os>` is
 `macos` on macOS, else the `ID` of `/etc/os-release` as it stands (`fedora`,
 `arch`, `debian`).
